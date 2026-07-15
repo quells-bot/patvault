@@ -3,6 +3,7 @@ package commands
 import (
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -57,6 +58,7 @@ func runList(d *db.DB, kr encrypt.Keyring, out io.Writer, show, prune bool) erro
 	for _, c := range rows {
 		key, err := encrypt.DeriveKey(mk, c.Host, c.Path)
 		if err != nil {
+			fmt.Fprintf(os.Stderr, "patvault: warning: skipping %s/%s: %v\n", c.Host, c.Path, err)
 			continue
 		}
 		pat, err := encrypt.Decrypt(key, c.PAT)

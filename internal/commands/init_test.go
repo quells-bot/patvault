@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"bytes"
 	"path/filepath"
 	"testing"
 
@@ -32,15 +33,24 @@ func TestInitKeychainlessIdempotent(t *testing.T) {
 		t.Fatal(err)
 	}
 	fk := encrypt.FileKeyring{Path: keyPath}
-	first, _ := fk.Get(encrypt.MasterKeyService, encrypt.MasterKeyAccount)
+	first, err := fk.Get(encrypt.MasterKeyService, encrypt.MasterKeyAccount)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	cmd2 := NewInitCmd(keyPath)
 	cmd2.SetArgs([]string{"--keychainless"})
 	if err := cmd2.Execute(); err != nil {
 		t.Fatal(err)
 	}
-	second, _ := fk.Get(encrypt.MasterKeyService, encrypt.MasterKeyAccount)
+	second, err := fk.Get(encrypt.MasterKeyService, encrypt.MasterKeyAccount)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(first) != 32 || len(second) != 32 {
 		t.Fatal("keys not 32 bytes")
+	}
+	if !bytes.Equal(first, second) {
+		t.Fatal("second init returned a different key; idempotency violated")
 	}
 }

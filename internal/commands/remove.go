@@ -34,6 +34,6 @@ func runRemove(d *db.DB, out io.Writer, rawURL string) error {
 	if err := d.Delete(host, path); err != nil {
 		return fmt.Errorf("delete: %w", err)
 	}
-	fmt.Printf("Removed credential for %s/%s\n", host, path)
+	fmt.Fprintf(out, "Removed credential for %s/%s\n", host, path)
 	return nil
 }
