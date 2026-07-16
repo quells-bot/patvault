@@ -137,6 +137,47 @@ func checkNoAuth(base string) {
 	fmt.Printf("      unauthenticated status = %d\n", resp.StatusCode)
 }
 
+// lsRefs sends a v2 ls-refs command and returns the object id of HEAD.
+func lsRefs(base, token string) string {
+	const name = "ls-refs round-trip"
+	var body bytes.Buffer
+	writePktLine(&body, "command=ls-refs\n")
+	writePktLine(&body, "object-format=sha1\n")
+	writeDelim(&body)
+	writePktLine(&body, "peel\n")
+	writePktLine(&body, "symrefs\n")
+	writePktLine(&body, "ref-prefix HEAD\n")
+	writeFlush(&body)
+
+	resp, err := doPOST(base+"/git-upload-pack", token,
+		"application/x-git-upload-pack-request", body.Bytes())
+	if err != nil {
+		fail(name, "request error: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		fail(name, "status %d (want 200)", resp.StatusCode)
+	}
+	lines, err := readUntilFlush(resp.Body)
+	if err != nil {
+		fail(name, "reading refs: %v", err)
+	}
+	var head string
+	for _, l := range lines {
+		fields := strings.Fields(string(l))
+		if len(fields) >= 2 && fields[1] == "HEAD" {
+			head = fields[0]
+			break
+		}
+	}
+	if head == "" {
+		fail(name, "no HEAD ref found in %d ref lines", len(lines))
+	}
+	pass(name)
+	fmt.Printf("      HEAD = %s\n", head)
+	return head
+}
+
 func main() {
 	repo := os.Getenv("SPIKE_REPO")
 	token := os.Getenv("SPIKE_TOKEN")
@@ -152,6 +193,8 @@ func main() {
 	} else {
 		fmt.Println("SKIP: no-auth rejected (SPIKE_PUBLIC set)")
 	}
+	head := lsRefs(base, token)
+	_ = head
 
-	fmt.Println("\n(advertisement checks passed)")
+	fmt.Println("\n(advertisement + ls-refs checks passed)")
 }
