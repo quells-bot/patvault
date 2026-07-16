@@ -3,7 +3,9 @@
 // binary; its pkt-line helpers inform internal/relay/pktline.go.
 //
 // Run:
-//   SPIKE_REPO=owner/repo SPIKE_TOKEN=<fine-grained PAT> go run ./spike/relay-v2
+//
+//	SPIKE_REPO=owner/repo SPIKE_TOKEN=<fine-grained PAT> go run ./spike/relay-v2
+//
 // Use a private repo (or set SPIKE_PUBLIC=1 to skip the no-auth check).
 package main
 
