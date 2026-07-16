@@ -125,6 +125,23 @@ The boundary is a genuine machine boundary. A compromised agent in the guest can
 reach only the relay's **socket** — never its process memory, its database, or
 the Keychain, which live on a different machine (VM escape out of scope).
 
+### Known limitation: flat authorization (v1)
+
+The agent-compromise mitigation above says a compromised key can do "only what
+that key is authorized for" — but in v1 **every authorized key is authorized for
+everything**: any key in the allowlist may reach any repo that has a stored PAT.
+So a single compromised agent key's blast radius is *all* stored repos, not just
+the one that agent legitimately works on. The relay narrows the credential from
+portable to proxied-and-revocable, but it does not yet narrow *which* repos a
+given key may reach.
+
+Per-key → repo scoping (see "Deferred to v2") is the intended fix. Until then,
+the interim guidance is to keep each relay's PAT set minimal, and to run a
+**separate relay instance per trust domain** (its own host key, allowlist, and
+store) rather than pooling unrelated repos behind one allowlist. This limitation
+is acceptable for a first pass but should be closed before the relay fronts
+repos of materially different sensitivity.
+
 ## Architecture
 
 ```
@@ -482,7 +499,9 @@ authenticated by the agent's SSH key. Note the fail-before-first-byte checks
 ## Deferred to v2
 
 - Per-key → repo/permission authorization (an agent key scoped to a subset of
-  repos, and read-vs-write asymmetry).
+  repos, and read-vs-write asymmetry). **This closes the flat-authorization
+  limitation called out in the threat model** — the highest-priority
+  improvement, since v1 grants every authorized key access to every stored PAT.
 - Policy enforcement: approval-required pushes, force-push and ref-deletion
   denial, protected branches. (This is the space FINOS git-proxy occupies.)
 - Tamper-resistant audit log of every fetch/push per agent key (distinct from
