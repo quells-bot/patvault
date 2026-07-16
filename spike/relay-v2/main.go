@@ -178,6 +178,51 @@ func lsRefs(base, token string) string {
 	return head
 }
 
+// fetchPack sends a v2 fetch command for a single want (shallow, done) and
+// asserts the response contains a packfile section.
+func fetchPack(base, token, want string) {
+	const name = "fetch round-trip"
+	var body bytes.Buffer
+	writePktLine(&body, "command=fetch\n")
+	writePktLine(&body, "object-format=sha1\n")
+	writeDelim(&body)
+	writePktLine(&body, "no-progress\n")
+	writePktLine(&body, "deepen 1\n")
+	writePktLine(&body, "want "+want+"\n")
+	writePktLine(&body, "done\n")
+	writeFlush(&body)
+
+	resp, err := doPOST(base+"/git-upload-pack", token,
+		"application/x-git-upload-pack-request", body.Bytes())
+	if err != nil {
+		fail(name, "request error: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		fail(name, "status %d (want 200)", resp.StatusCode)
+	}
+
+	// Read pkt-lines until the "packfile" section header appears. Section
+	// headers are plain data pkt-lines whose payload is the section name;
+	// skip flush/delim and any other section (e.g. shallow-info). Once the
+	// packfile header is seen the negotiation has succeeded and we stop
+	// before the sideband-framed pack bytes.
+	for {
+		p, kind, err := readPktLine(resp.Body)
+		if err != nil {
+			fail(name, "reading response before packfile section: %v", err)
+		}
+		if kind == pktFlush || kind == pktDelim {
+			continue
+		}
+		if strings.TrimSpace(string(p)) == "packfile" {
+			pass(name)
+			fmt.Println("      received packfile section header")
+			return
+		}
+	}
+}
+
 func main() {
 	repo := os.Getenv("SPIKE_REPO")
 	token := os.Getenv("SPIKE_TOKEN")
@@ -194,7 +239,7 @@ func main() {
 		fmt.Println("SKIP: no-auth rejected (SPIKE_PUBLIC set)")
 	}
 	head := lsRefs(base, token)
-	_ = head
+	fetchPack(base, token, head)
 
-	fmt.Println("\n(advertisement + ls-refs checks passed)")
+	fmt.Println("\nALL CHECKS PASSED — v2 protocol assumptions validated")
 }
