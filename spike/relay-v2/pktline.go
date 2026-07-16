@@ -56,6 +56,9 @@ func readPktLine(r io.Reader) (payload []byte, kind int, err error) {
 	case 2, 3:
 		return nil, 0, fmt.Errorf("reserved pkt-line length %d", n)
 	}
+	if n > 65520 {
+		return nil, 0, fmt.Errorf("pkt-line length %d exceeds maximum 65520", n)
+	}
 	buf := make([]byte, n-4)
 	if _, err = io.ReadFull(r, buf); err != nil {
 		return nil, 0, fmt.Errorf("short pkt-line body (want %d bytes): %w", n-4, err)

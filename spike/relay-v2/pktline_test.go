@@ -42,10 +42,18 @@ func TestFlushAndDelim(t *testing.T) {
 
 func TestRoundTrip(t *testing.T) {
 	var buf bytes.Buffer
-	writePktLine(&buf, "command=ls-refs\n")
-	writeDelim(&buf)
-	writePktLine(&buf, "peel\n")
-	writeFlush(&buf)
+	if err := writePktLine(&buf, "command=ls-refs\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeDelim(&buf); err != nil {
+		t.Fatal(err)
+	}
+	if err := writePktLine(&buf, "peel\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFlush(&buf); err != nil {
+		t.Fatal(err)
+	}
 
 	p, kind, err := readPktLine(&buf)
 	if err != nil || kind != pktData || string(p) != "command=ls-refs\n" {
