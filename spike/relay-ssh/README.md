@@ -18,7 +18,10 @@ local `git` binary at itself. Requires `git` and OpenSSH `ssh` on PATH.
    (`docs/superpowers/specs/2026-07-15-relay-design.md`, §"Wire protocol").
 2. Under `protocol.version=0`, git does **not** announce `version=2`, so the v2
    gate can tell the two apart and fail closed.
-3. A real `git push` sends a `git-receive-pack` exec, and the exact exec string
+3. Under `protocol.version=1`, git **does** send `GIT_PROTOCOL` — carrying
+   `version=1`. The v2 gate must therefore compare the env request's *value*; a
+   gate keyed on the request's presence admits a v1 client as v2 and fails open.
+4. A real `git push` sends a `git-receive-pack` exec, and the exact exec string
    is recorded for `internal/relay/exec.go`'s parser.
 
 The server accepts any public key and refuses every exec with exit-status 1, so

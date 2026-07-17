@@ -163,6 +163,51 @@ func scenarioFetchV0(hostKey ssh.Signer, keyPath string) {
 	fmt.Printf("      exec          = %q\n", c.Exec)
 }
 
+// scenarioFetchV1 pins the case that decides how the v2 gate is written. Unlike
+// v0, git DOES send GIT_PROTOCOL under protocol.version=1 — it just carries
+// version=1. A gate keyed on the presence of the env request therefore admits a
+// v1 client as if it were v2 and pumps a v1 negotiation into the v2 stateless
+// path; the gate must compare the value.
+//
+// This asserts more than scenarioFetchV0 does deliberately. The safety property
+// (never announces version=2) is the same, but the presence-and-value assertion
+// is what the relay's gate is written against, so it is pinned here rather than
+// left to a reader's assumption.
+func scenarioFetchV1(hostKey ssh.Signer, keyPath string) {
+	const name = "protocol v1 fetch announces version=1, not version=2"
+
+	var out string
+	c := scenario(hostKey, func(url string) {
+		out, _ = runGitIn(".", keyPath, "-c", "protocol.version=1", "ls-remote", url)
+	})
+
+	if c.Err != nil {
+		fail(name, "capture error: %v (git output: %s)", c.Err, out)
+	}
+	if !c.ExecSeen {
+		fail(name, "no exec request arrived; order=%v (git output: %s)", c.Order, out)
+	}
+	v, ok := c.gitProtocol()
+	if ok && v == "version=2" {
+		fail(name, "git announced version=2 under protocol.version=1 — "+
+			"the v2 gate cannot distinguish v1 from v2; order=%v", c.Order)
+	}
+	if !ok {
+		fail(name, "git sent NO GIT_PROTOCOL env request under protocol.version=1; "+
+			"order=%v envs=%v (expected version=1 — if this git really omits it, the "+
+			"findings note's presence-vs-value claim needs revisiting) (git output: %s)",
+			c.Order, c.Envs, out)
+	}
+	if v != "version=1" {
+		fail(name, "GIT_PROTOCOL=%q, want %q", v, "version=1")
+	}
+	pass(name)
+	fmt.Printf("      GIT_PROTOCOL  = %q (sent, but not version=2 —\n", v)
+	fmt.Printf("                      a presence-only v2 gate would fail open here)\n")
+	fmt.Printf("      request order = %v\n", c.Order)
+	fmt.Printf("      exec          = %q\n", c.Exec)
+}
+
 // scenarioPush captures the exec string a real push sends. The spec's exec
 // parser must accept git-receive-pack and normalize the path; this records what
 // it will actually receive rather than what we assume.
@@ -229,6 +274,7 @@ func main() {
 	}
 	scenarioFetch(hostKey, keyPath)
 	scenarioFetchV0(hostKey, keyPath)
+	scenarioFetchV1(hostKey, keyPath)
 	scenarioPush(hostKey, keyPath, dir)
 
 	fmt.Println("\nALL CHECKS PASSED — agent-facing v2 signalling and push exec validated")
