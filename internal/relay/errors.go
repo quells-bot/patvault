@@ -92,3 +92,48 @@ func errInternal() *relayError {
 		retryable: false,
 	}
 }
+// errGitHubAuth is the 401/403 row: GitHub rejected the token. The wording is
+// the base spec's §"Errors and exit codes" table, copied verbatim. The spec
+// marks this status→message mapping as inferred, not observed (§"Unverified
+// assumptions"); slice 5 confirms it against the real Git endpoints. The repo is
+// formatted bare (no host prefix) — the message already names "github".
+func errGitHubAuth(repo string) *relayError {
+	return &relayError{
+		msg: fmt.Sprintf(
+			"patvault: github rejected the token for %s (revoked or insufficient scope); refresh with 'patvault add' on the host — this will not succeed until then",
+			repo),
+		exit:      1,
+		retryable: false,
+	}
+}
+
+// errGitHubNotFound is the 404 row: the repo does not exist, or the token cannot
+// see it. GitHub's Git endpoint returns 404 for both a missing repo and a
+// private repo the token lacks access to — the same existence-hiding ambiguity
+// the REST API uses.
+func errGitHubNotFound(repo string) *relayError {
+	return &relayError{
+		msg: fmt.Sprintf(
+			"patvault: %s not found, or the stored token cannot see it",
+			repo),
+		exit:      1,
+		retryable: false,
+	}
+}
+
+// errGitHubUnreachable is the 5xx / network row. status is the HTTP status code
+// when one was received, or 0 for a transport-level failure (DNS, refused,
+// timeout). The "(503)" in the spec's table is an example; the code is
+// interpolated so 502/503/504 all read correctly, and a network failure omits
+// the parenthetical rather than inventing a code. Always retryable.
+func errGitHubUnreachable(status int) *relayError {
+	qualifier := ""
+	if status > 0 {
+		qualifier = fmt.Sprintf(" (%d)", status)
+	}
+	return &relayError{
+		msg:       fmt.Sprintf("patvault: github unreachable%s; safe to retry shortly", qualifier),
+		exit:      1,
+		retryable: true,
+	}
+}
