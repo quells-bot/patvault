@@ -301,7 +301,7 @@ func TestFetchPumpsCommandsVerbatimAndInOrder(t *testing.T) {
 	b := &Bridge{Client: stub.Client(), BaseURL: stub.URL}
 
 	// in = ls-refs command, then fetch command, then EOF.
-	in := bytes.NewReader(append(append(lsRefsCommand(), fetchCommand()...)))
+	in := bytes.NewReader(append(lsRefsCommand(), fetchCommand()...))
 	var out bytes.Buffer
 	if err := b.Fetch(context.Background(), Request{Repo: "owner/repo", PAT: "ghp_x"}, in, &out); err != nil {
 		t.Fatalf("Fetch returned %v", err)
