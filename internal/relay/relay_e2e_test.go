@@ -124,20 +124,22 @@ func requireUploadPack(t *testing.T) {
 	}
 }
 
-// uploadPackRepo runs git-upload-pack --stateless-rpc against repo, the way
-// git http-backend does internally. When advertise is true it runs
-// --advertise-refs (no stdin) and the caller prepends the smart-HTTP
-// "# service=" banner+flush to the output. Otherwise it reads one v2 command
-// from stdin and returns the response (refs, packfile, …) with sideband framing
-// exactly as git emits it. GIT_PROTOCOL comes from the request so the stub
-// mirrors the real server's protocol negotiation.
-func uploadPackRepo(t *testing.T, repo string, advertise bool, gitProto string, stdin io.Reader) []byte {
+// gitBackend runs git-<service> --stateless-rpc against repo, the way
+// git http-backend does internally. service is "upload-pack" or "receive-pack".
+// When advertise is true it runs --advertise-refs (no stdin) and the caller
+// prepends the smart-HTTP "# service=" banner+flush. Otherwise it reads one
+// stateless-rpc request from stdin and returns the response — refs+pack for
+// upload-pack; report-status for receive-pack, which also APPLIES the pushed pack
+// to repo. GIT_PROTOCOL comes from the request so the stub mirrors the real
+// server's protocol negotiation. Real git produces the bytes, so the framing the
+// relay pumps is ground truth, not invented.
+func gitBackend(t *testing.T, service, repo string, advertise bool, gitProto string, stdin io.Reader) []byte {
 	t.Helper()
 	out, err := exec.Command("git", "--exec-path").Output()
 	if err != nil {
 		t.Fatalf("git --exec-path: %v", err)
 	}
-	bin := filepath.Join(strings.TrimSpace(string(out)), "git-upload-pack")
+	bin := filepath.Join(strings.TrimSpace(string(out)), "git-"+service)
 	args := []string{"--stateless-rpc"}
 	if advertise {
 		args = append(args, "--advertise-refs")
@@ -150,32 +152,35 @@ func uploadPackRepo(t *testing.T, repo string, advertise bool, gitProto string, 
 	cmd.Stderr = &stderr
 	data, err := cmd.Output()
 	if err != nil {
-		t.Fatalf("git-upload-pack %v: %v\n%s", args, err, stderr.String())
+		t.Fatalf("git-%s %v: %v\n%s", service, args, err, stderr.String())
 	}
 	return data
 }
 
 // newStubUpstreamServer stands up an httptest.Server that serves repo over the
-// v2 smart-HTTP protocol by delegating to git-upload-pack. It is the relay's
-// "stub upstream": real git produces the bytes (advertisement, refs, packfile),
-// so the framing the relay pumps is ground truth, not invented. The stub serves
-// one repo; the URL path is matched by suffix only.
+// smart-HTTP protocol by delegating to git-upload-pack (fetch) and
+// git-receive-pack (push). Real git produces the bytes — advertisement, refs,
+// packfile, report-status — so the framing the relay pumps is ground truth. The
+// URL path is matched by suffix; the service comes from the ?service= query.
 func newStubUpstreamServer(t *testing.T, repo string) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gitProto := r.Header.Get("Git-Protocol")
 		switch {
 		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "info/refs"):
-			adv := uploadPackRepo(t, repo, true, gitProto, nil)
-			// Prepend the smart-HTTP banner+flush that --advertise-refs omits
-			// (git http-backend adds it; the stub replicates that). Probed
-			// 2026-07-17: --advertise-refs emits the v2 advertisement with no banner.
-			writePkt(w, "# service=git-upload-pack\n")
+			service := strings.TrimPrefix(r.URL.Query().Get("service"), "git-")
+			adv := gitBackend(t, service, repo, true, gitProto, nil)
+			// Prepend the smart-HTTP banner+flush that --advertise-refs omits (git
+			// http-backend adds it; the stub replicates that). Probed 2026-07-17:
+			// receive-pack --advertise-refs emits the classic advertisement with
+			// no banner, exactly as upload-pack does.
+			writePkt(w, "# service=git-"+service+"\n")
 			writeFlush(w)
 			w.Write(adv)
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "git-upload-pack"):
-			resp := uploadPackRepo(t, repo, false, gitProto, r.Body)
-			w.Write(resp)
+			w.Write(gitBackend(t, "upload-pack", repo, false, gitProto, r.Body))
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "git-receive-pack"):
+			w.Write(gitBackend(t, "receive-pack", repo, false, gitProto, r.Body))
 		default:
 			http.NotFound(w, r)
 		}
@@ -213,6 +218,36 @@ func mustRunGit(t *testing.T, dir string, args ...string) {
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git %v in %s: %v\n%s", args, dir, err, out)
 	}
+}
+
+// requireReceivePack skips when git-receive-pack is not installed. The e2e stub
+// upstream shells out to it (as git http-backend does internally) so a real
+// report-status — and a real pack application — is produced by git itself.
+func requireReceivePack(t *testing.T) {
+	t.Helper()
+	out, err := exec.Command("git", "--exec-path").Output()
+	if err != nil {
+		t.Skipf("git --exec-path failed: %v", err)
+		return
+	}
+	bin := filepath.Join(strings.TrimSpace(string(out)), "git-receive-pack")
+	if _, err := os.Stat(bin); err != nil {
+		t.Skipf("git-receive-pack not found at %s", bin)
+	}
+}
+
+// gitOutput runs git in dir, fails the test on error, and returns stdout+stderr.
+// The mirror of mustRunGit (which discards output) for assertions that read a
+// value back — e.g. rev-parse. No SSH env; for local repo inspection only.
+func gitOutput(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v in %s: %v\n%s", args, dir, err, out)
+	}
+	return string(out)
 }
 
 // The slice gate. A real git, refused by a real relay, must show the operator the
@@ -364,5 +399,63 @@ func TestRealGitCloneAndIncrementalFetchThroughRelay(t *testing.T) {
 	out := runGitOK(t, dest, keyPath, v2, "log", "--oneline", "origin/main")
 	if !strings.Contains(out, "second") {
 		t.Errorf("incremental fetch did not bring the new commit:\n%s", out)
+	}
+}
+
+// The slice-4 gate. A real git push through the relay backed by a
+// git-receive-pack stub upstream must succeed end to end AND advance the upstream
+// ref. This is the anti-drift gate: the real client, the real relay, and a real
+// (git-backed) upstream exchange real receive-pack bytes — a raw packfile the
+// relay pumps to EOF and a sideband-framed report-status it pumps back untouched.
+// The upstream ref moving proves the pushed pack was applied, not just echoed.
+func TestRealGitPushThroughRelay(t *testing.T) {
+	requireGit(t)
+	requireReceivePack(t)
+
+	priv, signer := newE2EKey(t)
+	dir := t.TempDir()
+	keyPath := writeClientKey(t, dir, priv)
+
+	// Upstream: a bare repo seeded from a real work repo with content.
+	src := makeSourceRepo(t)
+	bare := filepath.Join(t.TempDir(), "e2erepo.git")
+	mustRunGit(t, src, "clone", "--bare", "-q", src, bare)
+	baseSHA := strings.Fields(gitOutput(t, bare, "rev-parse", "main"))[0]
+	upstream := newStubUpstreamServer(t, bare)
+
+	// Relay: real Server, real Bridge pointed at the stub upstream.
+	s := newTestServer(t, string(ssh.MarshalAuthorizedKey(signer.PublicKey())))
+	s.Bridge = &Bridge{Client: upstream.Client(), BaseURL: upstream.URL}
+	storePAT(t, s.OpenDB, s.Keyring, "owner/e2erepo", "ghp_stub", nil)
+	addr := startRelay(t, s)
+
+	// A local work clone (straight from the bare on disk) to push FROM.
+	work := filepath.Join(t.TempDir(), "work")
+	mustRunGit(t, filepath.Dir(work), "clone", "-q", bare, work)
+	mustRunGit(t, work, "config", "user.email", "relay-e2e@example.invalid")
+	mustRunGit(t, work, "config", "user.name", "relay-e2e")
+	if err := os.WriteFile(filepath.Join(work, "pushed.txt"),
+		[]byte("pushed through the relay\n"), 0o644); err != nil {
+		t.Fatalf("write pushed.txt: %v", err)
+	}
+	mustRunGit(t, work, "add", "pushed.txt")
+	mustRunGit(t, work, "commit", "-q", "-m", "second")
+	newSHA := strings.Fields(gitOutput(t, work, "rev-parse", "HEAD"))[0]
+
+	// Push through the relay.
+	pushURL := "ssh://git@" + addr + "/owner/e2erepo.git"
+	out := runGitOK(t, work, keyPath, nil, "push", pushURL, "HEAD:refs/heads/main")
+	// The PAT the relay injected upstream must never reach the client.
+	if strings.Contains(out, "ghp_stub") {
+		t.Errorf("push output leaked the PAT: %q", out)
+	}
+
+	// The upstream ref must now be at the pushed commit — the pack was applied.
+	after := strings.Fields(gitOutput(t, bare, "rev-parse", "main"))[0]
+	if after == baseSHA {
+		t.Errorf("upstream main did not move: still %s", baseSHA)
+	}
+	if after != newSHA {
+		t.Errorf("upstream main = %s, want the pushed commit %s", after, newSHA)
 	}
 }
