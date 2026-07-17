@@ -92,6 +92,7 @@ func errInternal() *relayError {
 		retryable: false,
 	}
 }
+
 // errGitHubAuth is the 401/403 row: GitHub rejected the token. The wording is
 // the base spec's §"Errors and exit codes" table, copied verbatim. The spec
 // marks this status→message mapping as inferred, not observed (§"Unverified

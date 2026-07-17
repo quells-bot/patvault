@@ -265,6 +265,7 @@ func TestPushReturnsErrorUntilSlice4(t *testing.T) {
 		t.Errorf("Push returned a *relayError %v; want a plain error dispatch maps to internal", err)
 	}
 }
+
 // A hand-rolled v2 ls-refs command, exactly the bytes a real git client sends:
 // "command=ls-refs\n", "object-format=sha1\n", a delim-pkt, "ref-prefix HEAD\n",
 // a flush-pkt. readCommand returns these bytes verbatim (framing intact) for
