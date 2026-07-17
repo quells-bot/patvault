@@ -64,10 +64,14 @@ func readPacket(r io.Reader) (payload []byte, kind int, err error) {
 // unmodified, ready to be forwarded verbatim as an HTTP request body. An
 // interior delim-pkt does not terminate a command.
 //
-// It returns io.EOF, and no bytes, when r is already at end of stream — the
-// client has no more commands, which is how the fetch pump's loop ends. A
-// stream that ends after a whole packet but before a flush is a truncation,
-// reported as io.ErrUnexpectedEOF.
+// It returns io.EOF, and no bytes, for either of the two ways a client says it
+// has no more commands, which is how the fetch pump's loop ends: the stream is
+// already at its end, or the client sent an empty-request. gitprotocol-v2 spells
+// the latter "request = empty-request | command-request" with "empty-request =
+// flush-pkt" — a lone flush-pkt means "no more requests will be made", so it is
+// a termination rather than a command to forward. A stream that ends after a
+// whole packet but before a flush is a truncation, reported as
+// io.ErrUnexpectedEOF.
 func readCommand(r io.Reader) ([]byte, error) {
 	// The tee is what keeps the bytes verbatim: readPacket parses from it
 	// while every byte it consumes accumulates in raw, so nothing is
@@ -75,7 +79,7 @@ func readCommand(r io.Reader) ([]byte, error) {
 	var raw bytes.Buffer
 	tee := io.TeeReader(r, &raw)
 
-	for {
+	for n := 0; ; n++ {
 		_, kind, err := readPacket(tee)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
@@ -87,6 +91,12 @@ func readCommand(r io.Reader) ([]byte, error) {
 			return nil, err
 		}
 		if kind == pktFlush {
+			// A flush in first position closes nothing: no command was
+			// opened, so this is an empty-request. A command always opens
+			// with a data pkt-line ("command=…").
+			if n == 0 {
+				return nil, io.EOF
+			}
 			return raw.Bytes(), nil
 		}
 	}

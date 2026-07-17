@@ -129,6 +129,47 @@ func TestReadCommandRoundTripsBytesVerbatim(t *testing.T) {
 	}
 }
 
+// gitprotocol-v2's grammar is "request = empty-request | command-request",
+// where "empty-request = flush-pkt": a client may send a lone flush to say no
+// more requests are coming. That is a termination, not a command — forwarding
+// "0000" upstream as a request body would POST garbage to GitHub.
+func TestReadCommandEmptyRequestIsEOF(t *testing.T) {
+	got, err := readCommand(strings.NewReader("0000"))
+	if !errors.Is(err, io.EOF) {
+		t.Errorf("err = %v, want io.EOF", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("returned %q, want no bytes", got)
+	}
+}
+
+// The empty-request arrives after a real command, on the same channel: the
+// client asks for what it wants, then says it is done.
+func TestReadCommandEmptyRequestAfterCommand(t *testing.T) {
+	const cmd = "0014command=ls-refs\n0000"
+	r := strings.NewReader(cmd + "0000")
+
+	got, err := readCommand(r)
+	if err != nil {
+		t.Fatalf("first readCommand: %v", err)
+	}
+	if string(got) != cmd {
+		t.Errorf("first command = %q, want %q", got, cmd)
+	}
+
+	if _, err := readCommand(r); !errors.Is(err, io.EOF) {
+		t.Errorf("empty request: err = %v, want io.EOF", err)
+	}
+}
+
+// A delim-pkt is interior framing, never a terminator: a command that opened
+// with one would still be waiting for its flush.
+func TestReadCommandLeadingDelimIsNotEmptyRequest(t *testing.T) {
+	if _, err := readCommand(strings.NewReader("0001")); errors.Is(err, io.EOF) {
+		t.Errorf("leading delim then EOF: err = %v, want a truncation error", err)
+	}
+}
+
 func TestReadCommandStopsAtFirstFlush(t *testing.T) {
 	const first = "0014command=ls-refs\n0000"
 	const second = "0012command=fetch\n0000"
