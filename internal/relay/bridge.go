@@ -47,9 +47,43 @@ func (b *Bridge) Push(ctx context.Context, req Request, in io.Reader, out io.Wri
 	return b.pushPack(ctx, req, in, out)
 }
 
-// pushPack is Task 2. Task 1 ships the advertisement only.
-func (b *Bridge) pushPack(_ context.Context, _ Request, in io.Reader, _ io.Writer) error {
-	_ = in
+// pushPack streams the client's ref-update commands + packfile to
+// git-receive-pack and streams the report-status back verbatim.
+//
+// The body is the client's stream copied until EOF: git sends commands + flush +
+// a raw (un-pkt-line-framed) packfile and then half-closes its write side, so the
+// bridge never parses the pack. A delete-only push (commands + flush, no pack) is
+// the same code path. The body length is unknown until EOF, so the POST goes out
+// chunked (ContentLength = -1) — the same framing in production (an ssh.Channel
+// body) and in tests (a *bytes.Reader body), and what git's own remote-curl
+// sends. See docs/superpowers/notes/2026-07-16-relay-push-framing-probe.md.
+//
+// The report-status reply — possibly sideband-framed (side-band-64k) and possibly
+// carrying `ng` rejection lines — is pumped to out untouched. Reframing it breaks
+// the client outright ("bad band"); pass-through is the whole job.
+func (b *Bridge) pushPack(ctx context.Context, req Request, in io.Reader, out io.Writer) error {
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		b.endpoint(req, "git-receive-pack"), in)
+	if err != nil {
+		return fmt.Errorf("build receive-pack request: %w", err)
+	}
+	// Force chunked: the length is unknown until the client's EOF.
+	httpReq.ContentLength = -1
+	setUpstreamHeaders(httpReq, req, "application/x-git-receive-pack-request")
+	httpReq.Header.Set("Accept", "application/x-git-receive-pack-result")
+
+	resp, err := b.Client.Do(httpReq)
+	if err != nil {
+		return errGitHubUnreachable(0)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return classifyStatus(req.Repo, resp.StatusCode)
+	}
+	if _, err := io.Copy(out, resp.Body); err != nil {
+		return fmt.Errorf("copy report-status: %w", err)
+	}
 	return nil
 }
 

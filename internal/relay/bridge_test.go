@@ -77,6 +77,7 @@ func stubReceivePackAdvertisement() []byte {
 // stubReq records one upstream request's headers and body.
 type stubReq struct {
 	auth, gitProto, accept, ctype string
+	chunked                       bool
 	body                          []byte
 }
 
@@ -103,7 +104,8 @@ func newStubUpstream(t *testing.T, adv []byte, postResp func() io.Reader, getSta
 		s.mu.Lock()
 		rec := stubReq{
 			auth: r.Header.Get("Authorization"), gitProto: r.Header.Get("Git-Protocol"),
-			accept: r.Header.Get("Accept"), ctype: r.Header.Get("Content-Type"), body: body,
+			accept: r.Header.Get("Accept"), ctype: r.Header.Get("Content-Type"),
+			chunked: len(r.TransferEncoding) > 0, body: body,
 		}
 		s.mu.Unlock()
 		switch {
@@ -126,6 +128,16 @@ func newStubUpstream(t *testing.T, adv []byte, postResp func() io.Reader, getSta
 				return
 			}
 			w.Header().Set("Content-Type", "application/x-git-upload-pack-result")
+			io.Copy(w, s.postResp())
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "git-receive-pack"):
+			s.mu.Lock()
+			s.posts = append(s.posts, rec)
+			s.mu.Unlock()
+			if s.postStatus != 0 {
+				w.WriteHeader(s.postStatus)
+				return
+			}
+			w.Header().Set("Content-Type", "application/x-git-receive-pack-result")
 			io.Copy(w, s.postResp())
 		default:
 			w.WriteHeader(http.StatusNotFound)
@@ -545,5 +557,166 @@ func TestFetchRespectsContextCancellation(t *testing.T) {
 	err := b.Fetch(ctx, Request{Repo: "o/r", PAT: "p"}, strings.NewReader(""), io.Discard)
 	if err == nil {
 		t.Error("Fetch returned nil; want an error after ctx cancellation")
+	}
+}
+
+// pushCommands is a hand-rolled receive-pack request body: one ref-update command
+// pkt-line (old-oid new-oid ref, NUL, capabilities), a flush-pkt, then a stand-in
+// "pack" (the bridge never parses it, so opaque bytes are faithful — git sends a
+// raw, un-pkt-line-framed pack here). withPack=false is the delete-only shape:
+// commands + flush and nothing after.
+func pushCommands(withPack bool) []byte {
+	var b strings.Builder
+	writePkt(&b, "0000000000000000000000000000000000000000 "+
+		"bf13b4419cf93eabd9b18d4ad9c2210a9268fdef refs/heads/main\x00"+
+		"report-status side-band-64k object-format=sha1 agent=git/2.53.0-Linux")
+	writeFlush(&b)
+	out := []byte(b.String())
+	if withPack {
+		out = append(out, []byte("PACK\x00\x00\x00\x02rawpackbytes-not-pkt-framed")...)
+	}
+	return out
+}
+
+// sidebandReportStatus is a report-status riding sideband channel 1 (\x01), the
+// framing GitHub uses when the client requested side-band-64k. It carries an `ng`
+// rejection line — the path the live push spike never exercised. The bridge must
+// reproduce these bytes exactly; reframing them breaks the client with "bad band".
+func sidebandReportStatus() []byte {
+	var status strings.Builder
+	writePkt(&status, "unpack ok\n")
+	writePkt(&status, "ng refs/heads/main non-fast-forward\n")
+	writeFlush(&status)
+	var b strings.Builder
+	writePkt(&b, "\x01"+status.String()) // one band-1 chunk carrying the status
+	writeFlush(&b)
+	return []byte(b.String())
+}
+
+func TestPushStreamsClientBodyToUpstreamAndReportStatusBack(t *testing.T) {
+	report := []byte("000eunpack ok\n0019ok refs/heads/main\n0000")
+	stub := newStubUpstream(t, stubReceivePackAdvertisement(),
+		func() io.Reader { return bytes.NewReader(report) }, 0, 0)
+	b := &Bridge{Client: stub.Client(), BaseURL: stub.URL}
+
+	body := pushCommands(true)
+	var out bytes.Buffer
+	if err := b.Push(context.Background(), Request{Repo: "owner/repo", PAT: "ghp_x"}, bytes.NewReader(body), &out); err != nil {
+		t.Fatalf("Push returned %v", err)
+	}
+
+	// out = advertisement (banner stripped) + report-status, verbatim.
+	want := append(stripBanner(stubReceivePackAdvertisement()), report...)
+	if got := out.Bytes(); !bytes.Equal(got, want) {
+		t.Errorf("out =\n%q\nwant\n%q", got, want)
+	}
+	// The upstream received the client's commands+pack byte-for-byte.
+	posts := stub.recordedPosts()
+	if len(posts) != 1 {
+		t.Fatalf("recorded %d POSTs, want 1", len(posts))
+	}
+	if !bytes.Equal(posts[0].body, body) {
+		t.Errorf("POST body = %q, want the client's commands+pack %q", posts[0].body, body)
+	}
+}
+
+func TestPushSendsChunkedRequestBody(t *testing.T) {
+	stub := newStubUpstream(t, stubReceivePackAdvertisement(),
+		func() io.Reader { return bytes.NewReader([]byte("000eunpack ok\n0000")) }, 0, 0)
+	b := &Bridge{Client: stub.Client(), BaseURL: stub.URL}
+
+	if err := b.Push(context.Background(), Request{Repo: "owner/repo", PAT: "ghp_x"}, bytes.NewReader(pushCommands(true)), io.Discard); err != nil {
+		t.Fatalf("Push returned %v", err)
+	}
+	posts := stub.recordedPosts()
+	if len(posts) != 1 {
+		t.Fatalf("recorded %d POSTs, want 1", len(posts))
+	}
+	if !posts[0].chunked {
+		t.Error("receive-pack POST was not chunked; the body length is unknown up front and must go out chunked")
+	}
+}
+
+func TestPushInjectsPostHeaders(t *testing.T) {
+	stub := newStubUpstream(t, stubReceivePackAdvertisement(),
+		func() io.Reader { return bytes.NewReader([]byte("000eunpack ok\n0000")) }, 0, 0)
+	b := &Bridge{Client: stub.Client(), BaseURL: stub.URL}
+
+	if err := b.Push(context.Background(), Request{Repo: "owner/repo", PAT: "ghp_secret"}, bytes.NewReader(pushCommands(true)), io.Discard); err != nil {
+		t.Fatalf("Push returned %v", err)
+	}
+	p := stub.recordedPosts()[0]
+	if got := basicAuth(p.auth); got != "x-access-token:ghp_secret" {
+		t.Errorf("POST Authorization = %q, want Basic x-access-token:ghp_secret", p.auth)
+	}
+	if p.ctype != "application/x-git-receive-pack-request" {
+		t.Errorf("POST Content-Type = %q, want receive-pack-request", p.ctype)
+	}
+	if p.accept != "application/x-git-receive-pack-result" {
+		t.Errorf("POST Accept = %q, want receive-pack-result", p.accept)
+	}
+}
+
+// The report-status may be sideband-framed and may carry `ng` rejection lines.
+// The bridge pumps it byte-for-byte; a single reframed byte breaks the client.
+func TestPushForwardsSidebandReportStatusVerbatim(t *testing.T) {
+	report := sidebandReportStatus()
+	stub := newStubUpstream(t, stubReceivePackAdvertisement(),
+		func() io.Reader { return bytes.NewReader(report) }, 0, 0)
+	b := &Bridge{Client: stub.Client(), BaseURL: stub.URL}
+
+	var out bytes.Buffer
+	if err := b.Push(context.Background(), Request{Repo: "owner/repo", PAT: "ghp_x"}, bytes.NewReader(pushCommands(true)), &out); err != nil {
+		t.Fatalf("Push returned %v", err)
+	}
+	tail := out.Bytes()[len(stripBanner(stubReceivePackAdvertisement())):]
+	if !bytes.Equal(tail, report) {
+		t.Errorf("report-status not forwarded verbatim:\ngot  %q\nwant %q", tail, report)
+	}
+	if !bytes.Contains(tail, []byte{0x01}) {
+		t.Error("sideband channel marker (\\x01) was stripped — the bridge reframed the reply")
+	}
+	if !bytes.Contains(tail, []byte("ng refs/heads/main")) {
+		t.Error("ng rejection line did not survive pass-through")
+	}
+}
+
+// A delete-only push sends commands + flush and no pack. It is the same code
+// path: the body ends at the client's EOF regardless of whether a pack followed.
+func TestPushDeleteOnlyHasNoPack(t *testing.T) {
+	stub := newStubUpstream(t, stubReceivePackAdvertisement(),
+		func() io.Reader { return bytes.NewReader([]byte("000eunpack ok\n0000")) }, 0, 0)
+	b := &Bridge{Client: stub.Client(), BaseURL: stub.URL}
+
+	body := pushCommands(false) // commands + flush, no pack
+	if err := b.Push(context.Background(), Request{Repo: "owner/repo", PAT: "ghp_x"}, bytes.NewReader(body), io.Discard); err != nil {
+		t.Fatalf("Push returned %v", err)
+	}
+	posts := stub.recordedPosts()
+	if len(posts) != 1 {
+		t.Fatalf("recorded %d POSTs, want 1", len(posts))
+	}
+	if !bytes.Equal(posts[0].body, body) {
+		t.Errorf("delete-only POST body = %q, want commands+flush %q", posts[0].body, body)
+	}
+}
+
+// The channel-aliasing pin for push: the bridge must never echo the client's
+// commands+pack back to out. Only the advertisement and the report-status appear.
+func TestPushDoesNotLoopbackClientBytes(t *testing.T) {
+	stub := newStubUpstream(t, stubReceivePackAdvertisement(),
+		func() io.Reader { return bytes.NewReader([]byte("000eunpack ok\n0000")) }, 0, 0)
+	b := &Bridge{Client: stub.Client(), BaseURL: stub.URL}
+
+	body := pushCommands(true)
+	var out bytes.Buffer
+	if err := b.Push(context.Background(), Request{Repo: "owner/repo", PAT: "ghp_x"}, bytes.NewReader(body), &out); err != nil {
+		t.Fatalf("Push returned %v", err)
+	}
+	if bytes.Contains(out.Bytes(), []byte("rawpackbytes-not-pkt-framed")) {
+		t.Errorf("client pack bytes were echoed back to out (loopback):\nout=%q", out.Bytes())
+	}
+	if bytes.Contains(out.Bytes(), []byte("refs/heads/main\x00report-status side-band-64k")) {
+		t.Errorf("client command bytes leaked into out:\n%q", out.Bytes())
 	}
 }
