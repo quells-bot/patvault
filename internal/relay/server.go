@@ -9,8 +9,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -145,4 +147,189 @@ func (s *Server) resolve(repo string) (Request, error) {
 		return Request{}, fmt.Errorf("decrypt: %w", err)
 	}
 	return Request{Repo: repo, PAT: string(pat)}, nil
+}
+
+// SSH channel-request payloads. These mirror RFC 4254 and are the shape
+// spike/relay-ssh/sshreq.go pinned against a real client.
+type (
+	envRequest  struct{ Name, Value string }
+	execRequest struct{ Command string }
+	exitStatus  struct{ Status uint32 }
+)
+
+// Serve accepts connections on ln until ctx is cancelled, then stops accepting
+// and waits for in-flight sessions to drain. It returns nil after a graceful
+// shutdown.
+//
+// It takes a listener rather than an address so the caller owns the bind — which
+// is what lets commands/relay.go refuse a wildcard address and tests bind
+// 127.0.0.1:0.
+func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
+	hostKey, created, err := loadOrCreateHostKey(s.HostKeyPath)
+	if err != nil {
+		return err
+	}
+	if created {
+		s.logger().Info("generated relay host key",
+			"path", s.HostKeyPath,
+			"fingerprint", ssh.FingerprintSHA256(hostKey.PublicKey()))
+	}
+	keys, err := loadAuthorizedKeys(s.AuthKeysPath)
+	if err != nil {
+		return err
+	}
+
+	cfg := &ssh.ServerConfig{
+		PublicKeyCallback: func(_ ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+			fp := ssh.FingerprintSHA256(key)
+			if !keys.has(key) {
+				s.logger().Info("refused unlisted key", "fingerprint", fp)
+				return nil, fmt.Errorf("key %s is not authorized", fp)
+			}
+			// The fingerprint rides along so the session can log which agent it
+			// served without re-deriving it.
+			return &ssh.Permissions{Extensions: map[string]string{"fingerprint": fp}}, nil
+		},
+	}
+	cfg.AddHostKey(hostKey)
+
+	// Cancellation unblocks Accept by closing the listener.
+	go func() {
+		<-ctx.Done()
+		ln.Close()
+	}()
+
+	var wg sync.WaitGroup
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			if ctx.Err() != nil {
+				wg.Wait()
+				return nil
+			}
+			return fmt.Errorf("accept: %w", err)
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.handleConn(ctx, conn, cfg)
+		}()
+	}
+}
+
+// handleConn runs one SSH connection: handshake, then its session channels.
+func (s *Server) handleConn(ctx context.Context, conn net.Conn, cfg *ssh.ServerConfig) {
+	defer conn.Close()
+
+	sConn, chans, globalReqs, err := ssh.NewServerConn(conn, cfg)
+	if err != nil {
+		// An unlisted key lands here; PublicKeyCallback already logged it.
+		s.logger().Debug("handshake failed", "remote", conn.RemoteAddr().String(), "err", err)
+		return
+	}
+	defer sConn.Close()
+	go ssh.DiscardRequests(globalReqs)
+
+	fp := sConn.Permissions.Extensions["fingerprint"]
+	for newCh := range chans {
+		if newCh.ChannelType() != "session" {
+			newCh.Reject(ssh.UnknownChannelType, "session only")
+			continue
+		}
+		s.handleSession(ctx, newCh, fp)
+	}
+}
+
+// handleSession runs one session channel's request loop: env requests are
+// captured, the exec is dispatched, and everything else is refused.
+//
+// The shape is spike/relay-ssh's serveOnce, which the findings note names as the
+// reference for exactly this loop.
+func (s *Server) handleSession(ctx context.Context, newCh ssh.NewChannel, fp string) {
+	ch, reqs, err := newCh.Accept()
+	if err != nil {
+		return
+	}
+	defer ch.Close()
+
+	// GIT_PROTOCOL arrives as an env request before the exec (relay-ssh spike),
+	// so the version is known by the time the exec is handled. Never count env
+	// requests: the caller's locale is forwarded through them too, so the count
+	// varies with the invoking shell.
+	var gitProtocol string
+
+	for req := range reqs {
+		switch req.Type {
+		case "env":
+			var e envRequest
+			if err := ssh.Unmarshal(req.Payload, &e); err != nil {
+				if req.WantReply {
+					req.Reply(false, nil)
+				}
+				s.refuse(ch, fp, "", "", errDisallowedExec(), fmt.Errorf("env payload: %w", err))
+				return
+			}
+			if e.Name == "GIT_PROTOCOL" {
+				gitProtocol = e.Value
+			}
+			if req.WantReply {
+				req.Reply(true, nil)
+			}
+
+		case "exec":
+			var x execRequest
+			if err := ssh.Unmarshal(req.Payload, &x); err != nil {
+				if req.WantReply {
+					req.Reply(false, nil)
+				}
+				s.refuse(ch, fp, "", "", errDisallowedExec(), fmt.Errorf("exec payload: %w", err))
+				return
+			}
+			if req.WantReply {
+				req.Reply(true, nil)
+			}
+			s.dispatch(ctx, ch, fp, x.Command, gitProtocol)
+			return
+
+		default:
+			// shell, pty-req, subsystem, ... — a relay serves git and nothing
+			// else, so these are the disallowed-exec row rather than a
+			// negotiation.
+			if req.WantReply {
+				req.Reply(false, nil)
+			}
+			s.refuse(ch, fp, "", "", errDisallowedExec(), fmt.Errorf("channel request %q", req.Type))
+			return
+		}
+	}
+}
+
+// dispatch turns one exec into an outcome.
+//
+// TASK 6 REPLACES THIS BODY. Until then the front door refuses everything, which
+// is this slice's whole point: a large share of the error table is testable with
+// no upstream in existence.
+func (s *Server) dispatch(ctx context.Context, ch ssh.Channel, fp, cmd, gitProtocol string) {
+	s.refuse(ch, fp, "", "", errDisallowedExec(), fmt.Errorf("exec %q: no dispatch yet", cmd))
+}
+
+// refuse writes err's message to the channel's stderr and closes with its exit
+// status, then records the outcome host-side.
+//
+// Errors never touch stdout: git parses stdout as pkt-lines, so text injected
+// there corrupts the parse. Over SSH git passes remote stderr straight to the
+// user's terminal, which is why a patvault:-prefixed line is readable there.
+func (s *Server) refuse(ch ssh.Channel, fp, op, repo string, clientErr *relayError, cause error) {
+	fmt.Fprintln(ch.Stderr(), clientErr.Error())
+	ch.SendRequest("exit-status", false, ssh.Marshal(exitStatus{Status: clientErr.Exit()}))
+
+	// The operational log records the agent, the operation, and why — never the
+	// PAT.
+	s.logger().Info("refused",
+		"fingerprint", fp,
+		"op", op,
+		"repo", repo,
+		"exit", clientErr.Exit(),
+		"retryable", clientErr.Retryable(),
+		"cause", cause)
 }
