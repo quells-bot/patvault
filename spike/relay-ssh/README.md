@@ -21,7 +21,11 @@ local `git` binary at itself. Requires `git` and OpenSSH `ssh` on PATH.
 3. Under `protocol.version=1`, git **does** send `GIT_PROTOCOL` — carrying
    `version=1`. The v2 gate must therefore compare the env request's *value*; a
    gate keyed on the request's presence admits a v1 client as v2 and fails open.
-4. A real `git push` sends a `git-receive-pack` exec, and the exact exec string
+4. The exec string's path is the **request URL's path, verbatim** — git neither
+   appends nor strips `.git`. A path containing an apostrophe comes back
+   POSIX-escaped (`'/owner/it'\''s.git'`), so `internal/relay/exec.go` must
+   shell-split rather than strip the outer quotes.
+5. A real `git push` sends a `git-receive-pack` exec, and the exact exec string
    is recorded for `internal/relay/exec.go`'s parser.
 
 The server accepts any public key and refuses every exec with exit-status 1, so

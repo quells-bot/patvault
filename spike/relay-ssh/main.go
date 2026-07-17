@@ -67,10 +67,17 @@ func runGitIn(dir, keyPath string, args ...string) (string, error) {
 	return string(out), err
 }
 
-// scenario stands up a capture server, hands its ssh:// URL to run, and returns
-// what the server saw. run is expected to fail (the server always refuses); its
-// error is the caller's to ignore.
-func scenario(hostKey ssh.Signer, run func(url string)) *capture {
+// defaultRepoPath is the URL path the protocol-version scenarios use. It is
+// spelled out at each call site rather than baked into scenario() because the
+// ".git" here is the *caller's* choice: git echoes the URL path into the exec
+// string verbatim, so a suffix baked in here would look like git's doing. See
+// scenarioExecPaths.
+const defaultRepoPath = "/owner/repo.git"
+
+// scenario stands up a capture server, hands it an ssh:// URL with repoPath as
+// the path component, and returns what the server saw. run is expected to fail
+// (the server always refuses); its error is the caller's to ignore.
+func scenario(hostKey ssh.Signer, repoPath string, run func(url string)) *capture {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "listen: %v\n", err)
@@ -81,7 +88,7 @@ func scenario(hostKey ssh.Signer, run func(url string)) *capture {
 	done := make(chan *capture, 1)
 	go func() { done <- serveOnce(ln, hostKey) }()
 
-	run(fmt.Sprintf("ssh://git@%s/owner/repo.git", ln.Addr().String()))
+	run(fmt.Sprintf("ssh://git@%s%s", ln.Addr().String(), repoPath))
 
 	select {
 	case c := <-done:
@@ -99,7 +106,7 @@ func scenarioFetch(hostKey ssh.Signer, keyPath string) {
 	const name = "fetch sends GIT_PROTOCOL=version=2 before exec"
 
 	var out string
-	c := scenario(hostKey, func(url string) {
+	c := scenario(hostKey, defaultRepoPath, func(url string) {
 		// ls-remote is the lightest command that triggers git-upload-pack.
 		// It fails against the capture server; that is expected.
 		out, _ = runGitIn(".", keyPath, "-c", "protocol.version=2", "ls-remote", url)
@@ -138,7 +145,7 @@ func scenarioFetchV0(hostKey ssh.Signer, keyPath string) {
 	const name = "protocol v0 fetch does not announce version=2"
 
 	var out string
-	c := scenario(hostKey, func(url string) {
+	c := scenario(hostKey, defaultRepoPath, func(url string) {
 		out, _ = runGitIn(".", keyPath, "-c", "protocol.version=0", "ls-remote", url)
 	})
 
@@ -177,7 +184,7 @@ func scenarioFetchV1(hostKey ssh.Signer, keyPath string) {
 	const name = "protocol v1 fetch announces version=1, not version=2"
 
 	var out string
-	c := scenario(hostKey, func(url string) {
+	c := scenario(hostKey, defaultRepoPath, func(url string) {
 		out, _ = runGitIn(".", keyPath, "-c", "protocol.version=1", "ls-remote", url)
 	})
 
@@ -208,6 +215,69 @@ func scenarioFetchV1(hostKey ssh.Signer, keyPath string) {
 	fmt.Printf("      exec          = %q\n", c.Exec)
 }
 
+// execPathCases pin what parseExec will actually be handed. Each drives a real
+// fetch at a URL whose path is `path`, and requires the captured exec string to
+// be exactly `want`.
+//
+// The first two are the correction to this spike's original findings note, which
+// claimed "git 2.53.0 appends .git to the repository path". It does not: it
+// echoes the URL's path through verbatim. The suffix is the user's remote URL's
+// business, so parseExec must tolerate its presence AND its absence — the reason
+// the spec normalizes, but not the reason the note gave.
+//
+// The apostrophe case is the one with teeth. Git emits POSIX single-quote
+// escaping — close, escaped quote, reopen — so the exec string for it's.git is
+// literally: git-upload-pack '/owner/it'\”s.git'
+// A parser that strips the first and last quote yields /owner/it'\”s.git, not
+// /owner/it's.git. This is what the spec's hazard 1 ("strip one level of shell
+// quoting rather than naive whitespace-splitting", line 210) is protecting
+// against, and nothing verified it until now. Note the spec's hazard 3 wording,
+// "strip the surrounding quotes" (line 218), describes exactly the naive parse
+// that gets this wrong; parseExec needs a shell-word split.
+//
+// These paths are not valid GitHub repo names, so the spec's shape check (line
+// 223) rejects all but the first two regardless. They are here to pin the
+// quoting contract, not to suggest the relay should serve them.
+var execPathCases = []struct {
+	what string
+	path string // path component of the ssh:// URL git is pointed at
+	want string // the exec string the server must receive, verbatim
+}{
+	{"suffixed path passes through", "/owner/repo.git", `git-upload-pack '/owner/repo.git'`},
+	{"unsuffixed path stays unsuffixed", "/owner/repo", `git-upload-pack '/owner/repo'`},
+	{"space survives inside quotes", "/owner/my repo.git", `git-upload-pack '/owner/my repo.git'`},
+	{"apostrophe is POSIX-escaped", "/owner/it's.git", `git-upload-pack '/owner/it'\''s.git'`},
+}
+
+// scenarioExecPaths proves the exec path is the URL path and nothing else.
+func scenarioExecPaths(hostKey ssh.Signer, keyPath string) {
+	const name = "exec path is the URL path, verbatim"
+
+	got := make([]string, len(execPathCases))
+	for i, tc := range execPathCases {
+		var out string
+		c := scenario(hostKey, tc.path, func(url string) {
+			out, _ = runGitIn(".", keyPath, "-c", "protocol.version=2", "ls-remote", url)
+		})
+
+		if c.Err != nil {
+			fail(name, "%s: capture error: %v (git output: %s)", tc.what, c.Err, out)
+		}
+		if !c.ExecSeen {
+			fail(name, "%s: no exec request arrived; order=%v (git output: %s)",
+				tc.what, c.Order, out)
+		}
+		if c.Exec != tc.want {
+			fail(name, "%s: exec = %q, want %q", tc.what, c.Exec, tc.want)
+		}
+		got[i] = c.Exec
+	}
+	pass(name)
+	for i, tc := range execPathCases {
+		fmt.Printf("      %-34s %q\n", tc.what+":", got[i])
+	}
+}
+
 // scenarioPush captures the exec string a real push sends. The spec's exec
 // parser must accept git-receive-pack and normalize the path; this records what
 // it will actually receive rather than what we assume.
@@ -230,7 +300,7 @@ func scenarioPush(hostKey ssh.Signer, keyPath, dir string) {
 	}
 
 	var out string
-	c := scenario(hostKey, func(url string) {
+	c := scenario(hostKey, defaultRepoPath, func(url string) {
 		out, _ = runGitIn(repo, keyPath, "push", url, "HEAD:refs/heads/main")
 	})
 
@@ -275,6 +345,7 @@ func main() {
 	scenarioFetch(hostKey, keyPath)
 	scenarioFetchV0(hostKey, keyPath)
 	scenarioFetchV1(hostKey, keyPath)
+	scenarioExecPaths(hostKey, keyPath)
 	scenarioPush(hostKey, keyPath, dir)
 
 	fmt.Println("\nALL CHECKS PASSED — agent-facing v2 signalling and push exec validated")
