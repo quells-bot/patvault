@@ -31,7 +31,9 @@ func doGET(url, token, accept string) (*http.Response, error) {
 		return nil, err
 	}
 	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
+		// GitHub's Git HTTP transport takes Basic, not Bearer; the username is
+		// ignored for a PAT.
+		req.SetBasicAuth("x-access-token", token)
 	}
 	req.Header.Set("Git-Protocol", "version=2")
 	req.Header.Set("User-Agent", "git/2.43.0")
@@ -46,7 +48,7 @@ func doPOST(url, token, contentType string, body []byte) (*http.Response, error)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
+	req.SetBasicAuth("x-access-token", token)
 	req.Header.Set("Git-Protocol", "version=2")
 	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("User-Agent", "git/2.43.0")
