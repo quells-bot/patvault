@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -108,24 +109,71 @@ func (b *Bridge) advertise(ctx context.Context, req Request, out io.Writer) erro
 	return nil
 }
 
-// pumpCommands loops over the client's v2 commands. Implemented in Task 3.
-func (b *Bridge) pumpCommands(_ context.Context, _ Request, in io.Reader, _ io.Writer) error {
-	// Task 2 stub: the advertisement is done; if the client sent nothing more
-	// (test in == EOF) we are finished. Task 3 replaces this body with the
-	// readCommand loop.
-	_ = in
+// pumpCommands loops over the client's v2 commands: read one command up to its
+// terminating flush-pkt (readCommand returns io.EOF when the client is done),
+// POST it to git-upload-pack, and stream the response back to out verbatim. The
+// response is never interpreted — sideband framing, section order, and pack
+// bytes pass through untouched, which is what makes partial/shallow clones and
+// sideband progress work for free.
+//
+// This is the half-duplex-in-time core: read a command, write its response,
+// repeat. The bridge never writes a response while still reading a command, and
+// never reads the next command while a response is in flight — so the aliased
+// ssh.Channel's read and write halves never collide.
+func (b *Bridge) pumpCommands(ctx context.Context, req Request, in io.Reader, out io.Writer) error {
+	for {
+		cmd, err := readCommand(in)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return fmt.Errorf("read client command: %w", err)
+		}
+		if err := b.postCommand(ctx, req, cmd, out); err != nil {
+			return err
+		}
+	}
+}
+
+// postCommand POSTs one command (framing intact, as readCommand returned it) to
+// git-upload-pack and streams the response to out verbatim. The command body is
+// bounded by its flush-pkt, so Content-Length is known and the POST is not
+// chunked (chunked is only the push path's concern, in slice 4).
+func (b *Bridge) postCommand(ctx context.Context, req Request, cmd []byte, out io.Writer) error {
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		b.endpoint(req, "git-upload-pack"), bytes.NewReader(cmd))
+	if err != nil {
+		return fmt.Errorf("build command request: %w", err)
+	}
+	setUpstreamHeaders(httpReq, req, "application/x-git-upload-pack-request")
+	httpReq.Header.Set("Accept", "application/x-git-upload-pack-result")
+
+	resp, err := b.Client.Do(httpReq)
+	if err != nil {
+		return errGitHubUnreachable(0)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return classifyStatus(req.Repo, resp.StatusCode)
+	}
+	if _, err := io.Copy(out, resp.Body); err != nil {
+		return fmt.Errorf("copy command response: %w", err)
+	}
 	return nil
 }
 
 // setUpstreamHeaders sets the headers every upstream request carries: the PAT
 // as HTTP Basic auth (the username is the conventional x-access-token
 // placeholder — GitHub's Git transport takes Basic, not Bearer), the v2
-// protocol marker, and the per-request content type. The User-Agent matches
-// what the relay-v2 spike sent to real GitHub and had accepted.
-func setUpstreamHeaders(req *http.Request, r Request, accept string) {
+// protocol marker, and the per-request content type and accept type. The
+// User-Agent matches what the relay-v2 spike sent to real GitHub and had
+// accepted.
+func setUpstreamHeaders(req *http.Request, r Request, contentType string) {
 	req.SetBasicAuth("x-access-token", r.PAT)
 	req.Header.Set("Git-Protocol", gitProtocolV2)
-	req.Header.Set("Accept", accept)
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("Accept", contentType)
 	req.Header.Set("User-Agent", "git/2.43.0")
 }
 

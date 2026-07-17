@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // writePkt writes s as one pkt-line (4-byte hex length prefix + payload). Test
@@ -262,5 +263,191 @@ func TestPushReturnsErrorUntilSlice4(t *testing.T) {
 	var re *relayError
 	if errors.As(err, &re) {
 		t.Errorf("Push returned a *relayError %v; want a plain error dispatch maps to internal", err)
+	}
+}
+// A hand-rolled v2 ls-refs command, exactly the bytes a real git client sends:
+// "command=ls-refs\n", "object-format=sha1\n", a delim-pkt, "ref-prefix HEAD\n",
+// a flush-pkt. readCommand returns these bytes verbatim (framing intact) for
+// the bridge to POST.
+func lsRefsCommand() []byte {
+	var b strings.Builder
+	writePkt(&b, "command=ls-refs\n")
+	writePkt(&b, "object-format=sha1\n")
+	io.WriteString(&b, "0001") // delim-pkt
+	writePkt(&b, "ref-prefix HEAD\n")
+	writeFlush(&b)
+	return []byte(b.String())
+}
+
+func fetchCommand() []byte {
+	var b strings.Builder
+	writePkt(&b, "command=fetch\n")
+	writePkt(&b, "object-format=sha1\n")
+	io.WriteString(&b, "0001")
+	writePkt(&b, "no-progress\n")
+	writePkt(&b, "want 0000000000000000000000000000000000000000\n")
+	writePkt(&b, "done\n")
+	writeFlush(&b)
+	return []byte(b.String())
+}
+
+func TestFetchPumpsCommandsVerbatimAndInOrder(t *testing.T) {
+	// Each POST returns a distinct canned response; assert they reach out in
+	// order, after the advertisement, byte-for-byte.
+	calls := 0
+	responses := [][]byte{[]byte("LS-REFS-RESPONSE"), []byte("FETCH-RESPONSE")}
+	stub := newStubUpstream(t, stubAdvertisement(),
+		func() io.Reader { r := responses[calls]; calls++; return bytes.NewReader(r) }, 0, 0)
+	b := &Bridge{Client: stub.Client(), BaseURL: stub.URL}
+
+	// in = ls-refs command, then fetch command, then EOF.
+	in := bytes.NewReader(append(append(lsRefsCommand(), fetchCommand()...)))
+	var out bytes.Buffer
+	if err := b.Fetch(context.Background(), Request{Repo: "owner/repo", PAT: "ghp_x"}, in, &out); err != nil {
+		t.Fatalf("Fetch returned %v", err)
+	}
+
+	want := append(advWithoutBanner(), append(responses[0], responses[1]...)...)
+	if got := out.Bytes(); !bytes.Equal(got, want) {
+		t.Errorf("out =\n%q\nwant\n%q", got, want)
+	}
+
+	posts := stub.recordedPosts()
+	if len(posts) != 2 {
+		t.Fatalf("recorded %d POSTs, want 2", len(posts))
+	}
+	if !bytes.Equal(posts[0].body, lsRefsCommand()) {
+		t.Errorf("POST 0 body = %q, want the ls-refs command", posts[0].body)
+	}
+	if !bytes.Equal(posts[1].body, fetchCommand()) {
+		t.Errorf("POST 1 body = %q, want the fetch command", posts[1].body)
+	}
+}
+
+func TestFetchInjectsPostHeaders(t *testing.T) {
+	stub := newStubUpstream(t, stubAdvertisement(),
+		func() io.Reader { return bytes.NewReader([]byte("r")) }, 0, 0)
+	b := &Bridge{Client: stub.Client(), BaseURL: stub.URL}
+
+	in := bytes.NewReader(lsRefsCommand())
+	if err := b.Fetch(context.Background(), Request{Repo: "owner/repo", PAT: "ghp_secret"}, in, io.Discard); err != nil {
+		t.Fatalf("Fetch returned %v", err)
+	}
+	posts := stub.recordedPosts()
+	if len(posts) != 1 {
+		t.Fatalf("recorded %d POSTs, want 1", len(posts))
+	}
+	p := posts[0]
+	if got := basicAuth(p.auth); got != "x-access-token:ghp_secret" {
+		t.Errorf("POST Authorization = %q, want Basic x-access-token:ghp_secret", p.auth)
+	}
+	if p.gitProto != "version=2" {
+		t.Errorf("POST Git-Protocol = %q, want version=2", p.gitProto)
+	}
+	if p.ctype != "application/x-git-upload-pack-request" {
+		t.Errorf("POST Content-Type = %q, want request", p.ctype)
+	}
+	if p.accept != "application/x-git-upload-pack-result" {
+		t.Errorf("POST Accept = %q, want result", p.accept)
+	}
+}
+
+// The channel-aliasing note's pin: the bridge must never echo the client's own
+// command bytes back to out (io.Copy(out, in) would). Assert the command bytes
+// the client sent do not appear in out — only the advertisement and responses do.
+func TestFetchDoesNotLoopbackClientBytes(t *testing.T) {
+	stub := newStubUpstream(t, stubAdvertisement(),
+		func() io.Reader { return bytes.NewReader([]byte("RESP")) }, 0, 0)
+	b := &Bridge{Client: stub.Client(), BaseURL: stub.URL}
+
+	cmd := lsRefsCommand()
+	in := bytes.NewReader(cmd)
+	var out bytes.Buffer
+	if err := b.Fetch(context.Background(), Request{Repo: "owner/repo", PAT: "ghp_x"}, in, &out); err != nil {
+		t.Fatalf("Fetch returned %v", err)
+	}
+	if bytes.Contains(out.Bytes(), cmd) {
+		t.Errorf("client command bytes were echoed back to out (loopback):\nout=%q", out.Bytes())
+	}
+	if bytes.Contains(out.Bytes(), []byte("command=ls-refs")) {
+		t.Errorf("command text leaked into out:\n%q", out.Bytes())
+	}
+}
+
+// Stream, never buffer: the bridge must write advertisement bytes to out as they
+// arrive, not hold the whole body until EOF. The GET handler writes
+// banner+flush+FIRST, flushes, then waits for the bridge to deliver FIRST to out
+// before ending the body. A streaming bridge closes the signal promptly; a
+// buffering bridge holds FIRST until EOF, which never arrives while it waits —
+// the 2s timeout distinguishes them, deterministically.
+func TestFetchStreamsAdvertisementWithoutBuffering(t *testing.T) {
+	first := []byte("FIRST-CHUNK")
+	bridgeWrote := make(chan struct{})
+	streamed := make(chan bool, 1)
+
+	out := &signalingWriter{firstWritten: bridgeWrote}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writePkt(w, "# service=git-upload-pack\n")
+		writeFlush(w)
+		w.Write(first)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		select {
+		case <-bridgeWrote:
+			streamed <- true
+		case <-time.After(2 * time.Second):
+			streamed <- false
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	b := &Bridge{Client: srv.Client(), BaseURL: srv.URL}
+	done := make(chan error, 1)
+	go func() {
+		done <- b.Fetch(context.Background(), Request{Repo: "o/r", PAT: "p"}, strings.NewReader(""), out)
+	}()
+	if err := <-done; err != nil {
+		t.Fatalf("Fetch returned %v", err)
+	}
+	if !<-streamed {
+		t.Error("FIRST did not reach out before the body EOF — bridge is buffering, not streaming")
+	}
+	if !bytes.Contains(out.bytes, first) {
+		t.Errorf("out missing FIRST: %q", out.bytes)
+	}
+}
+
+// signalingWriter records all bytes written and closes firstWritten on the first
+// Write — so the streaming test can observe the bridge delivering the first
+// chunk before the response body is complete.
+type signalingWriter struct {
+	bytes        []byte
+	firstWritten chan struct{}
+	once         sync.Once
+}
+
+func (w *signalingWriter) Write(p []byte) (int, error) {
+	w.bytes = append(w.bytes, p...)
+	w.once.Do(func() { close(w.firstWritten) })
+	return len(p), nil
+}
+
+func TestFetchRespectsContextCancellation(t *testing.T) {
+	// A GET that never responds: the bridge must return when ctx is cancelled.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	t.Cleanup(srv.Close)
+	b := &Bridge{Client: srv.Client(), BaseURL: srv.URL}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+	err := b.Fetch(ctx, Request{Repo: "o/r", PAT: "p"}, strings.NewReader(""), io.Discard)
+	if err == nil {
+		t.Error("Fetch returned nil; want an error after ctx cancellation")
 	}
 }
