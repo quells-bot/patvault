@@ -59,11 +59,12 @@ The key observations:
   entirely (3 env requests). The relay's v2 gate can therefore distinguish the
   two by the presence or absence of the env request — no need to parse the
   value.
-**Fetch exec string:** `git-upload-pack '/owner/repo.git'` — single-quoted,
+- **Fetch exec string:** `git-upload-pack '/owner/repo.git'` — single-quoted,
   **leading `/`**, **with `.git`** suffix.
+
 - **Push exec string:** `git-receive-pack '/owner/repo.git'` — single-quoted,
   **leading `/`**, **with `.git`** suffix.
-**The `.git` suffix is present in both cases.** The spec's example at line
+- **The `.git` suffix is present in both cases.** The spec's example at line
   210 shows `'owner/repo'` without `.git`; the actual binary sends
   `'/owner/repo.git'` for both fetch and push.
 
