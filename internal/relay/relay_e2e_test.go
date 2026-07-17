@@ -102,11 +102,10 @@ func TestRealGitIsRefusedWithThePatvaultMessage(t *testing.T) {
 	addr := startRelay(t, s)
 
 	tests := []struct {
-		name    string
-		repo    string
-		env     []string
-		want    string
-		wantNot string
+		name string
+		repo string
+		env  []string
+		want string
 	}{
 		{
 			name: "no stored PAT",

@@ -84,6 +84,24 @@ func TestLoadAuthorizedKeysMultipleKeys(t *testing.T) {
 	}
 }
 
+func TestLoadAuthorizedKeysCRLFLines(t *testing.T) {
+	key, line := newTestKey(t)
+	// Windows-style CRLF line endings
+	content := "# comment\r\n" + line + "\r\n"
+
+	path := writeFile(t, "authorized_keys", content)
+	keys, err := loadAuthorizedKeys(path)
+	if err != nil {
+		t.Fatalf("loadAuthorizedKeys with CRLF: %v", err)
+	}
+	if len(keys) != 1 {
+		t.Errorf("loaded %d keys, want 1", len(keys))
+	}
+	if !keys.has(key) {
+		t.Error("key not in allowlist with CRLF line endings")
+	}
+}
+
 // A typo must not silently narrow the allowlist: an operator who mangled one
 // line would otherwise get a relay that refuses that agent for no visible
 // reason.

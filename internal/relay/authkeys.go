@@ -38,6 +38,7 @@ func loadAuthorizedKeys(path string) (authorizedKeys, error) {
 	}
 	keys := authorizedKeys{}
 	for i, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimRight(line, "\r")
 		if isBlankOrComment(line) {
 			continue
 		}

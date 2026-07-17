@@ -316,19 +316,22 @@ func runExec(t *testing.T, addr string, signer ssh.Signer, env map[string]string
 		Timeout:         10 * time.Second,
 	})
 	if err != nil {
-		t.Fatalf("dial: %v", err)
+		t.Errorf("dial: %v", err)
+		return "", -1
 	}
 	defer cc.Close()
 
 	sess, err := cc.NewSession()
 	if err != nil {
-		t.Fatalf("new session: %v", err)
+		t.Errorf("new session: %v", err)
+		return "", -1
 	}
 	defer sess.Close()
 
 	for k, v := range env {
 		if err := sess.Setenv(k, v); err != nil {
-			t.Fatalf("setenv %s: %v", k, err)
+			t.Errorf("setenv %s: %v", k, err)
+			return "", -1
 		}
 	}
 	var errBuf bytes.Buffer
@@ -340,8 +343,8 @@ func runExec(t *testing.T, addr string, signer ssh.Signer, env map[string]string
 	case *ssh.ExitError:
 		return errBuf.String(), err.ExitStatus()
 	default:
-		t.Fatalf("run %q: %v", cmd, err)
-		return "", 0
+		t.Errorf("run %q: %v", cmd, err)
+		return "", -1
 	}
 }
 
