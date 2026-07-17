@@ -319,6 +319,16 @@ Because the client's `fetch` command is forwarded verbatim, **partial clone
 2. **Update.** Relay the client's ref-update commands + packfile to
    `POST .../git-receive-pack` (PAT, `Content-Type:
    application/x-git-receive-pack-request`) and stream the `report-status` back.
+   **The client's EOF terminates the body.** git sends commands + flush + a raw
+   (un-framed) packfile and then half-closes its write side while still reading
+   the response, so the bridge copies the channel into the POST body until EOF
+   and never parses the pack — this is what keeps the push path a pump. It also
+   means a delete-only push (which sends no pack at all) needs no special case.
+   Confirmed by the push framing probe against a real git client; see
+   `docs/superpowers/notes/2026-07-16-relay-push-framing-probe.md`. The body
+   length is unknown up front, so the POST goes out chunked; that GitHub accepts
+   a chunked receive-pack body is **not yet verified** (see §"Unverified
+   assumptions").
 
 **Cross-cutting bridge rules:**
 
@@ -535,6 +545,14 @@ scheme, so "stated confidently, never tested" is a known failure mode here.
   covered by the stub-upstream and end-to-end tests in §Testing rather than by
   another spike — but any code that comes to depend on section order needs its
   own check first.
+- **GitHub accepting a chunked receive-pack request body is unverified.** The
+  push bridge cannot know the body length up front (the client's EOF is what
+  ends it), so the POST goes out with `Transfer-Encoding: chunked`. git's own
+  `remote-curl` uses chunked for large pushes, so this is expected to work, but
+  the push spike sent a fixed-length body and the live repo/PAT are gone. Fold
+  the check into the real-GitHub end-to-end run. If GitHub rejects it, the bridge
+  must buffer the pack to compute a `Content-Length`, in tension with §"Stream,
+  never buffer". See `docs/superpowers/notes/2026-07-16-relay-push-framing-probe.md`.
 - **The status→message mapping in §Errors is inferred, not observed.** The table
   maps 401/403 and 404 to distinct messages, but those statuses come from
   GitHub's *Git* transport, which does not behave like the REST API: an
