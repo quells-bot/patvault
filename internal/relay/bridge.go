@@ -62,8 +62,17 @@ func (b *Bridge) Push(ctx context.Context, req Request, in io.Reader, out io.Wri
 // carrying `ng` rejection lines — is pumped to out untouched. Reframing it breaks
 // the client outright ("bad band"); pass-through is the whole job.
 func (b *Bridge) pushPack(ctx context.Context, req Request, in io.Reader, out io.Writer) error {
+	// io.NopCloser is load-bearing, not decoration. In production in and out are
+	// the SAME aliased ssh.Channel (server.go dispatch hands ch as both). A real
+	// ssh.Channel is an io.ReadWriteCloser, so if it were passed as the body
+	// directly, net/http would use it as the request's ReadCloser and call
+	// Body.Close() after sending the body — closing the channel's read AND write
+	// halves before we write the report-status back to out. The client then sees
+	// "unexpected disconnect while reading sideband packet". Wrapping in a
+	// non-Closer keeps net/http from closing the channel; dispatch owns ch.Close().
+	// See docs/superpowers/notes/2026-07-17-relay-slice-3-channel-aliasing.md.
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		b.endpoint(req, "git-receive-pack"), in)
+		b.endpoint(req, "git-receive-pack"), io.NopCloser(in))
 	if err != nil {
 		return fmt.Errorf("build receive-pack request: %w", err)
 	}
