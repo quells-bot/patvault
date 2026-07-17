@@ -44,15 +44,34 @@ func stubAdvertisement() []byte {
 }
 
 // advWithoutBanner is stubAdvertisement with the banner+flush removed — what the
-// bridge must write to out.
+// fetch bridge must write to out.
 func advWithoutBanner() []byte {
-	full := stubAdvertisement()
-	// Drop the first two packets (banner data + flush) by parsing with readPacket.
+	return stripBanner(stubAdvertisement())
+}
+
+// stripBanner drops the first two packets (the "# service=" banner data pkt and
+// its flush) from a smart-HTTP advertisement, returning what the bridge forwards.
+// Shared by the fetch and push advertisement assertions.
+func stripBanner(full []byte) []byte {
 	r := bytes.NewReader(full)
 	readPacket(r) // banner
 	readPacket(r) // flush
 	rest, _ := io.ReadAll(r)
 	return rest
+}
+
+// stubReceivePackAdvertisement is a real-shape classic (non-v2) ref advertisement
+// — the ref line + NUL-separated capabilities git-receive-pack emits — prefixed
+// with the smart-HTTP "# service=git-receive-pack" banner + flush the SSH
+// transport does not use and the bridge must strip.
+func stubReceivePackAdvertisement() []byte {
+	var b strings.Builder
+	writePkt(&b, "# service=git-receive-pack\n")
+	writeFlush(&b)
+	writePkt(&b, "caea8767d0ef709639db64552a8d5d87957301ab refs/heads/main\x00"+
+		"report-status report-status-v2 delete-refs side-band-64k quiet atomic object-format=sha1\n")
+	writeFlush(&b)
+	return []byte(b.String())
 }
 
 // stubReq records one upstream request's headers and body.
@@ -252,17 +271,93 @@ func TestFetchMapsNetworkErrorToUnreachable(t *testing.T) {
 	}
 }
 
-func TestPushReturnsErrorUntilSlice4(t *testing.T) {
-	b := &Bridge{Client: &http.Client{}, BaseURL: "stub"}
-	err := b.Push(context.Background(), Request{Repo: "o/r", PAT: "p"}, strings.NewReader(""), io.Discard)
-	if err == nil {
-		t.Fatal("Push returned nil; slice 3 must refuse pushes")
+func TestPushStripsServiceBannerAndForwardsAdvertisement(t *testing.T) {
+	stub := newStubUpstream(t, stubReceivePackAdvertisement(),
+		func() io.Reader { return bytes.NewReader(nil) }, 0, 0)
+	b := &Bridge{Client: stub.Client(), BaseURL: stub.URL}
+
+	var out bytes.Buffer
+	err := b.Push(context.Background(), Request{Repo: "owner/repo", PAT: "ghp_x"}, strings.NewReader(""), &out)
+	if err != nil {
+		t.Fatalf("Push returned %v", err)
 	}
-	// The error must NOT be a *relayError, so dispatch maps it to errInternal
-	// (clientError in server.go), matching slice 2's nil-bridge behavior.
+	want := stripBanner(stubReceivePackAdvertisement())
+	if got := out.Bytes(); !bytes.Equal(got, want) {
+		t.Errorf("out =\n%q\nwant advertisement without banner:\n%q", got, want)
+	}
+	if bytes.Contains(out.Bytes(), []byte("# service=")) {
+		t.Errorf("out still contains the # service= banner:\n%q", out.Bytes())
+	}
+	if len(stub.recordedGets()) != 1 {
+		t.Errorf("recorded %d GETs, want 1", len(stub.recordedGets()))
+	}
+}
+
+func TestPushAdvertisementInjectsHeaders(t *testing.T) {
+	stub := newStubUpstream(t, stubReceivePackAdvertisement(),
+		func() io.Reader { return bytes.NewReader(nil) }, 0, 0)
+	b := &Bridge{Client: stub.Client(), BaseURL: stub.URL}
+
+	var out bytes.Buffer
+	if err := b.Push(context.Background(), Request{Repo: "owner/repo", PAT: "ghp_secret"}, strings.NewReader(""), &out); err != nil {
+		t.Fatalf("Push returned %v", err)
+	}
+	gets := stub.recordedGets()
+	if len(gets) != 1 {
+		t.Fatalf("recorded %d GETs, want 1", len(gets))
+	}
+	g := gets[0]
+	if got := basicAuth(g.auth); got != "x-access-token:ghp_secret" {
+		t.Errorf("GET Authorization = %q, want Basic x-access-token:ghp_secret", g.auth)
+	}
+	if g.accept != "application/x-git-receive-pack-advertisement" {
+		t.Errorf("GET Accept = %q, want receive-pack advertisement", g.accept)
+	}
+}
+
+func TestPushFailBeforeFirstByteOn500(t *testing.T) {
+	stub := newStubUpstream(t, nil, nil, http.StatusInternalServerError, 0)
+	b := &Bridge{Client: stub.Client(), BaseURL: stub.URL}
+
+	var out bytes.Buffer
+	err := b.Push(context.Background(), Request{Repo: "owner/repo", PAT: "ghp_x"}, strings.NewReader(""), &out)
+	if out.Len() != 0 {
+		t.Errorf("out = %d bytes, want 0 (fail-before-first-byte): %q", out.Len(), out.Bytes())
+	}
+	want := errGitHubUnreachable(500)
 	var re *relayError
-	if errors.As(err, &re) {
-		t.Errorf("Push returned a *relayError %v; want a plain error dispatch maps to internal", err)
+	if !errors.As(err, &re) {
+		t.Fatalf("Push returned %v, want a *relayError", err)
+	}
+	if re.Error() != want.Error() || !re.Retryable() {
+		t.Errorf("Push error = %v (retryable %v), want %v (retryable true)", re, re.Retryable(), want)
+	}
+}
+
+func TestPushAdvertisementMapsStatusToErrors(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+		want   *relayError
+	}{
+		{"401 maps to auth", http.StatusUnauthorized, errGitHubAuth("owner/repo")},
+		{"403 maps to auth", http.StatusForbidden, errGitHubAuth("owner/repo")},
+		{"404 maps to not-found", http.StatusNotFound, errGitHubNotFound("owner/repo")},
+		{"503 maps to unreachable", http.StatusServiceUnavailable, errGitHubUnreachable(503)},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			stub := newStubUpstream(t, nil, nil, tc.status, 0)
+			b := &Bridge{Client: stub.Client(), BaseURL: stub.URL}
+			err := b.Push(context.Background(), Request{Repo: "owner/repo", PAT: "ghp_x"}, strings.NewReader(""), io.Discard)
+			var re *relayError
+			if !errors.As(err, &re) {
+				t.Fatalf("got %v, want *relayError", err)
+			}
+			if re.Error() != tc.want.Error() || re.Retryable() != tc.want.Retryable() {
+				t.Errorf("got %q (retryable %v), want %q (retryable %v)", re, re.Retryable(), tc.want, tc.want.Retryable())
+			}
+		})
 	}
 }
 
