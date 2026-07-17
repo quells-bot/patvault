@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -162,6 +163,52 @@ func scenarioFetchV0(hostKey ssh.Signer, keyPath string) {
 	fmt.Printf("      exec          = %q\n", c.Exec)
 }
 
+// scenarioPush captures the exec string a real push sends. The spec's exec
+// parser must accept git-receive-pack and normalize the path; this records what
+// it will actually receive rather than what we assume.
+func scenarioPush(hostKey ssh.Signer, keyPath, dir string) {
+	const name = "push sends git-receive-pack exec"
+
+	repo := filepath.Join(dir, "pushsrc")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		fail(name, "mkdir: %v", err)
+	}
+	for _, args := range [][]string{
+		{"init", "-q", "-b", "main"},
+		{"config", "user.email", "spike@example.invalid"},
+		{"config", "user.name", "patvault spike"},
+		{"commit", "-q", "--allow-empty", "-m", "spike"},
+	} {
+		if out, err := runGitIn(repo, keyPath, args...); err != nil {
+			fail(name, "git %v: %v (%s)", args, err, out)
+		}
+	}
+
+	var out string
+	c := scenario(hostKey, func(url string) {
+		out, _ = runGitIn(repo, keyPath, "push", url, "HEAD:refs/heads/main")
+	})
+
+	if c.Err != nil {
+		fail(name, "capture error: %v (git output: %s)", c.Err, out)
+	}
+	if !c.ExecSeen {
+		fail(name, "no exec request arrived; order=%v (git output: %s)", c.Order, out)
+	}
+	if !strings.HasPrefix(c.Exec, "git-receive-pack ") {
+		fail(name, "exec = %q, want a git-receive-pack command", c.Exec)
+	}
+	pass(name)
+	v, ok := c.gitProtocol()
+	if ok {
+		fmt.Printf("      GIT_PROTOCOL  = %q\n", v)
+	} else {
+		fmt.Printf("      GIT_PROTOCOL  = <not sent>\n")
+	}
+	fmt.Printf("      request order = %v\n", c.Order)
+	fmt.Printf("      exec          = %q\n", c.Exec)
+}
+
 func main() {
 	dir, err := os.MkdirTemp("", "relay-ssh-spike")
 	if err != nil {
@@ -180,9 +227,9 @@ func main() {
 		fmt.Fprintf(os.Stderr, "client key: %v\n", err)
 		os.Exit(1)
 	}
-
 	scenarioFetch(hostKey, keyPath)
 	scenarioFetchV0(hostKey, keyPath)
+	scenarioPush(hostKey, keyPath, dir)
 
-	fmt.Println("\nALL CHECKS PASSED — agent-facing v2 signalling validated")
+	fmt.Println("\nALL CHECKS PASSED — agent-facing v2 signalling and push exec validated")
 }
