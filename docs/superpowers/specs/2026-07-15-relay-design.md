@@ -515,14 +515,18 @@ relay v2 spike (`docs/superpowers/notes/2026-07-16-relay-v2-spike-findings.md`)
 validated the v2 fetch protocol assumptions but falsified this spec's auth
 scheme, so "stated confidently, never tested" is a known failure mode here.
 
-- **Push against real GitHub is untested.** The spike covered `git-upload-pack`
-  only. "Push is unaffected ... bridges cleanly regardless of the negotiated
-  version" (§"Wire protocol") is unverified: the `git-receive-pack`
-  advertisement framing, the auth scheme on that endpoint, and the
-  commands+packfile POST / `report-status` round-trip have never touched
-  GitHub. A receive-pack `info/refs` GET against a throwaway private repo is a
-  read-only way to confirm the banner and auth; a real POST needs a repo that
-  can be written to. Settle this before `internal/relay` claims push support.
+- ~~**Push against real GitHub is untested.**~~ **SETTLED (2026-07-16)** — see
+  `docs/superpowers/notes/2026-07-16-relay-push-spike-findings.md`. A real push
+  to a private repo confirmed the `git-receive-pack` advertisement framing
+  (same `# service=` banner + flush as upload-pack), the auth scheme (Basic
+  **200**, Bearer 401, unauth 401 — the v2 note's Basic-not-Bearer correction
+  carries over), and the commands+packfile POST / `report-status` round-trip
+  (`unpack ok` / `ok <ref>`). "Push is unaffected by the version gate" also
+  held: receive-pack ignored a `Git-Protocol: version=2` header and answered a
+  classic ref-list. Two caveats survive into implementation: **a delete-only
+  push sends no pack at all**, so the bridge must not assume pack bytes follow
+  the commands; and the `report-status` **rejection (`ng`) path is still
+  unobserved** — every command in that run succeeded.
 - **The pack body has never been streamed end to end.** The spike stopped at the
   `packfile` section header, so sideband pass-through (§"Cross-cutting bridge
   rules"), the stream-never-buffer rule, and the fetch **section order** (whether

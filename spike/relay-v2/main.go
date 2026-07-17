@@ -245,5 +245,18 @@ func main() {
 	head := lsRefs(base, token)
 	fetchPack(base, token, head)
 
+	// Push, tier 1: read-only. Advertisement framing and auth scheme on the
+	// receive-pack endpoint. Nothing here writes.
+	checkReceivePackAdvertisement(base, token)
+	checkReceivePackAuth(base, token)
+
+	// Push, tier 2: writes to SPIKE_REPO. Opt-in, so no run mutates a repo by
+	// accident.
+	if os.Getenv("SPIKE_PUSH") != "" {
+		checkPush(base, token, repo)
+	} else {
+		fmt.Println("SKIP: push round-trip (set SPIKE_PUSH=1 to run; it writes to SPIKE_REPO)")
+	}
+
 	fmt.Println("\nALL CHECKS PASSED — v2 protocol assumptions validated")
 }
