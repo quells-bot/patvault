@@ -25,6 +25,7 @@ func main() {
 	root.AddCommand(buildListCmd())
 	root.AddCommand(buildRemoveCmd())
 	root.AddCommand(buildCredentialCmd())
+	root.AddCommand(buildRelayCmd())
 
 	if err := root.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -127,6 +128,28 @@ func buildCredentialCmd() *cobra.Command {
 		},
 	})
 	return cred
+}
+
+func defaultRelayHostKeyPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "patvault:", err)
+		os.Exit(1)
+	}
+	return filepath.Join(home, ".config", "patvault", "relay_host_ed25519")
+}
+
+func defaultRelayAuthKeysPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "patvault:", err)
+		os.Exit(1)
+	}
+	return filepath.Join(home, ".config", "patvault", "relay_authorized_keys")
+}
+
+func buildRelayCmd() *cobra.Command {
+	return commands.NewRelayCmd(openDB, selectKeyring(), defaultRelayHostKeyPath(), defaultRelayAuthKeysPath())
 }
 
 // exitCode maps a credential handler's numeric exit code onto cobra's RunE

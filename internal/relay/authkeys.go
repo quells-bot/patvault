@@ -113,6 +113,13 @@ func appendAuthorizedKey(allowlistPath, pubkeyFile string) (added bool, err erro
 	return true, nil
 }
 
+// AddKey appends the public key in pubkeyFile to the allowlist at
+// allowlistPath, reporting whether it was new. It is the exported face of
+// appendAuthorizedKey for 'patvault relay add-key'.
+func AddKey(allowlistPath, pubkeyFile string) (added bool, err error) {
+	return appendAuthorizedKey(allowlistPath, pubkeyFile)
+}
+
 // isBlankOrComment reports whether a line carries no key.
 func isBlankOrComment(line string) bool {
 	trimmed := strings.TrimSpace(line)
