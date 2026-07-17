@@ -4,6 +4,7 @@
 package relay
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -56,4 +57,37 @@ func readPacket(r io.Reader) (payload []byte, kind int, err error) {
 		return nil, 0, fmt.Errorf("short pkt-line body (want %d bytes): %w", n-4, err)
 	}
 	return buf, pktData, nil
+}
+
+// readCommand reads one complete protocol-v2 command from r: every byte from
+// its first pkt-line through its terminating flush-pkt, framing intact and
+// unmodified, ready to be forwarded verbatim as an HTTP request body. An
+// interior delim-pkt does not terminate a command.
+//
+// It returns io.EOF, and no bytes, when r is already at end of stream — the
+// client has no more commands, which is how the fetch pump's loop ends. A
+// stream that ends after a whole packet but before a flush is a truncation,
+// reported as io.ErrUnexpectedEOF.
+func readCommand(r io.Reader) ([]byte, error) {
+	// The tee is what keeps the bytes verbatim: readPacket parses from it
+	// while every byte it consumes accumulates in raw, so nothing is
+	// re-encoded on the way out.
+	var raw bytes.Buffer
+	tee := io.TeeReader(r, &raw)
+
+	for {
+		_, kind, err := readPacket(tee)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				if raw.Len() == 0 {
+					return nil, io.EOF
+				}
+				return nil, fmt.Errorf("stream ended before flush-pkt: %w", io.ErrUnexpectedEOF)
+			}
+			return nil, err
+		}
+		if kind == pktFlush {
+			return raw.Bytes(), nil
+		}
+	}
 }

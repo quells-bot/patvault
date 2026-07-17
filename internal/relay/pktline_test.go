@@ -107,3 +107,88 @@ func TestReadPacketTruncatedIsNotEOF(t *testing.T) {
 		t.Errorf("truncated prefix reported as EOF: %v", err)
 	}
 }
+
+func TestReadCommandRoundTripsBytesVerbatim(t *testing.T) {
+	// The ls-refs command spike/relay-v2/main.go sends, byte for byte. The
+	// bridge forwards this as an HTTP body unmodified, so the returned bytes
+	// must equal the input exactly — framing, interior delim, and all.
+	const cmd = "0014command=ls-refs\n" +
+		"0017object-format=sha1\n" +
+		"0001" +
+		"0009peel\n" +
+		"000csymrefs\n" +
+		"0014ref-prefix HEAD\n" +
+		"0000"
+
+	got, err := readCommand(strings.NewReader(cmd))
+	if err != nil {
+		t.Fatalf("readCommand: %v", err)
+	}
+	if string(got) != cmd {
+		t.Errorf("readCommand returned\n%q\nwant\n%q", got, cmd)
+	}
+}
+
+func TestReadCommandStopsAtFirstFlush(t *testing.T) {
+	const first = "0014command=ls-refs\n0000"
+	const second = "0012command=fetch\n0000"
+	r := strings.NewReader(first + second)
+
+	got, err := readCommand(r)
+	if err != nil {
+		t.Fatalf("first readCommand: %v", err)
+	}
+	if string(got) != first {
+		t.Errorf("first command = %q, want %q", got, first)
+	}
+
+	got, err = readCommand(r)
+	if err != nil {
+		t.Fatalf("second readCommand: %v", err)
+	}
+	if string(got) != second {
+		t.Errorf("second command = %q, want %q", got, second)
+	}
+
+	if _, err := readCommand(r); !errors.Is(err, io.EOF) {
+		t.Errorf("third readCommand: err = %v, want io.EOF", err)
+	}
+}
+
+// The pump loop's termination condition: no more commands is io.EOF, not an
+// error and not an empty command.
+func TestReadCommandCleanEOF(t *testing.T) {
+	got, err := readCommand(strings.NewReader(""))
+	if !errors.Is(err, io.EOF) {
+		t.Errorf("err = %v, want io.EOF", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("returned %q, want no bytes", got)
+	}
+}
+
+func TestReadCommandTruncated(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want error
+	}{
+		{"whole packet then EOF, no flush", "0014command=ls-refs\n", io.ErrUnexpectedEOF},
+		{"packet cut mid-body", "0014command", nil}, // some error, not EOF
+		{"invalid length", "0014command=ls-refs\nzzzz", nil},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := readCommand(strings.NewReader(tc.in))
+			if err == nil {
+				t.Fatalf("readCommand(%q) = nil error, want error", tc.in)
+			}
+			if errors.Is(err, io.EOF) {
+				t.Errorf("truncated input reported as clean EOF: %v", err)
+			}
+			if tc.want != nil && !errors.Is(err, tc.want) {
+				t.Errorf("err = %v, want %v", err, tc.want)
+			}
+		})
+	}
+}
