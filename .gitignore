@@ -1,4 +1,5 @@
 /patvault
 /tmp/
-*.testrelay-ssh
+*.test
 /relay-ssh
+/relay-v2
