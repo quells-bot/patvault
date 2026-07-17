@@ -53,8 +53,8 @@ func (b *Bridge) Fetch(ctx context.Context, req Request, in io.Reader, out io.Wr
 	if err := b.advertise(ctx, req, out); err != nil {
 		return err
 	}
-	// The command pump is added in Task 3. Until then, after the advertisement
-	// the client (in tests) sends EOF and Fetch returns cleanly.
+	// Then pump the client's v2 commands: one POST per command, each response
+	// streamed back verbatim, until the client sends EOF.
 	return b.pumpCommands(ctx, req, in, out)
 }
 
