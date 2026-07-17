@@ -273,7 +273,15 @@ single-shot, and bridges cleanly regardless of the negotiated version.
 This is the one substantial new component (`internal/relay/bridge.go`). It is a
 **server-side re-implementation of git's own `remote-curl`** — the client-side
 code that bridges git's local pkt-line protocol to smart-HTTP — run in the
-server direction, injecting `Authorization: Bearer <PAT>` upstream.
+server direction, injecting the PAT upstream as HTTP Basic auth:
+`Authorization: Basic base64("x-access-token:<PAT>")`.
+
+**Basic, not Bearer.** GitHub's Git HTTP transport (`github.com/<owner>/<repo>.git`)
+answers `Authorization: Bearer <PAT>` with 401, even for a valid fine-grained PAT
+that the REST API accepts on the same token. Bearer works on `api.github.com`;
+the Git endpoints do not honor it. The username in the Basic pair is ignored —
+`x-access-token` is the conventional placeholder. Confirmed by the relay v2 spike
+against real GitHub; see `docs/superpowers/notes/2026-07-16-relay-v2-spike-findings.md`.
 
 The relay does **not** need to understand refs, packs, wants, or haves. It moves
 framed pkt-lines between the SSH channel and HTTP bodies. It therefore needs
@@ -454,7 +462,7 @@ agent git            relay (host)                         GitHub
    │  'owner/repo' ──▶ ├─ resolve owner/repo → stored PAT    │
    │                  ├─ (expired? → stderr error, close)    │
    │                  ├─ GET info/refs?service=…receive-pack │
-   │                  │        Authorization: Bearer PAT ───▶│
+   │                  │        Authorization: Basic PAT ────▶│
    │                  ├─ (non-2xx? → stderr error, close)     │
    │ ◀── ref adv ─────┤◀──────────── ref advertisement ──────│
    │ ── cmds+pack ───▶├─ POST /git-receive-pack (PAT) ──────▶│
