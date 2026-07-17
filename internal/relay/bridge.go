@@ -119,7 +119,8 @@ func (b *Bridge) Fetch(ctx context.Context, req Request, in io.Reader, out io.Wr
 	return b.pumpCommands(ctx, req, in, out)
 }
 
-// endpoint builds the upload-pack URL for req: "<BaseURL>/<repo>.git/<service>".
+// endpoint builds the upstream URL for req and service:
+// "<BaseURL>/<repo>.git/<service>".
 func (b *Bridge) endpoint(req Request, service string) string {
 	return fmt.Sprintf("%s/%s.git/%s", trimSlash(b.BaseURL), req.Repo, service)
 }

@@ -444,6 +444,8 @@ func TestRealGitPushThroughRelay(t *testing.T) {
 
 	// Push through the relay.
 	pushURL := "ssh://git@" + addr + "/owner/e2erepo.git"
+	// No protocol.version env: push has no v2 gate (dispatch skips it for push),
+	// and the bridge forces Git-Protocol: version=2 upstream regardless.
 	out := runGitOK(t, work, keyPath, nil, "push", pushURL, "HEAD:refs/heads/main")
 	// The PAT the relay injected upstream must never reach the client.
 	if strings.Contains(out, "ghp_stub") {

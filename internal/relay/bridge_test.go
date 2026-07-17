@@ -720,3 +720,33 @@ func TestPushDoesNotLoopbackClientBytes(t *testing.T) {
 		t.Errorf("client command bytes leaked into out:\n%q", out.Bytes())
 	}
 }
+
+// countingChannel is an io.ReadWriteCloser that records Close() calls, standing
+// in for the ssh.Channel Push receives in production, where in and out are the
+// SAME channel. It guards the io.NopCloser wrap in pushPack: if that wrap were
+// removed, net/http would use this channel as the request body's ReadCloser and
+// Close() it after the send — closing the aliased channel before the
+// report-status is written. The *bytes.Reader used by the other push tests is not
+// an io.Closer, so it cannot catch this; only a real Closer can.
+type countingChannel struct {
+	io.Reader
+	closeCalls int
+}
+
+func (c *countingChannel) Write(p []byte) (int, error) { return len(p), nil }
+func (c *countingChannel) Close() error                { c.closeCalls++; return nil }
+
+func TestPushDoesNotCloseTheClientChannel(t *testing.T) {
+	report := []byte("000eunpack ok\n0000")
+	stub := newStubUpstream(t, stubReceivePackAdvertisement(),
+		func() io.Reader { return bytes.NewReader(report) }, 0, 0)
+	b := &Bridge{Client: stub.Client(), BaseURL: stub.URL}
+
+	ch := &countingChannel{Reader: bytes.NewReader(pushCommands(true))}
+	if err := b.Push(context.Background(), Request{Repo: "owner/repo", PAT: "ghp_x"}, ch, ch); err != nil {
+		t.Fatalf("Push returned %v", err)
+	}
+	if ch.closeCalls != 0 {
+		t.Errorf("Push let net/http close the client channel %d time(s); in production that closes the aliased ssh.Channel before the report-status is written", ch.closeCalls)
+	}
+}
