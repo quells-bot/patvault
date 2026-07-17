@@ -128,6 +128,40 @@ func scenarioFetch(hostKey ssh.Signer, keyPath string) {
 	fmt.Printf("      exec          = %q\n", c.Exec)
 }
 
+// scenarioFetchV0 pins the negative case. The relay must refuse a fetch that
+// did not announce v2, so "not v2" has to be distinguishable from v2. This
+// asserts the weaker, sufficient property — that git does not claim version=2
+// under protocol.version=0 — rather than guessing whether git omits the env
+// request entirely or sends a different value.
+func scenarioFetchV0(hostKey ssh.Signer, keyPath string) {
+	const name = "protocol v0 fetch does not announce version=2"
+
+	var out string
+	c := scenario(hostKey, func(url string) {
+		out, _ = runGitIn(".", keyPath, "-c", "protocol.version=0", "ls-remote", url)
+	})
+
+	if c.Err != nil {
+		fail(name, "capture error: %v (git output: %s)", c.Err, out)
+	}
+	if !c.ExecSeen {
+		fail(name, "no exec request arrived; order=%v (git output: %s)", c.Order, out)
+	}
+	v, ok := c.gitProtocol()
+	if ok && v == "version=2" {
+		fail(name, "git announced version=2 under protocol.version=0 — "+
+			"the v2 gate cannot distinguish v0 from v2; order=%v", c.Order)
+	}
+	pass(name)
+	if ok {
+		fmt.Printf("      GIT_PROTOCOL  = %q (sent, but not version=2)\n", v)
+	} else {
+		fmt.Printf("      GIT_PROTOCOL  = <not sent>\n")
+	}
+	fmt.Printf("      request order = %v\n", c.Order)
+	fmt.Printf("      exec          = %q\n", c.Exec)
+}
+
 func main() {
 	dir, err := os.MkdirTemp("", "relay-ssh-spike")
 	if err != nil {
@@ -148,6 +182,7 @@ func main() {
 	}
 
 	scenarioFetch(hostKey, keyPath)
+	scenarioFetchV0(hostKey, keyPath)
 
 	fmt.Println("\nALL CHECKS PASSED — agent-facing v2 signalling validated")
 }
