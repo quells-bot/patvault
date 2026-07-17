@@ -304,13 +304,73 @@ func (s *Server) handleSession(ctx context.Context, newCh ssh.NewChannel, fp str
 	}
 }
 
-// dispatch turns one exec into an outcome.
+// gitProtocolV2 is the exact GIT_PROTOCOL value that admits a fetch.
 //
-// TASK 6 REPLACES THIS BODY. Until then the front door refuses everything, which
-// is this slice's whole point: a large share of the error table is testable with
-// no upstream in existence.
+// The comparison is against the value, never the presence of the env request: a
+// real git sends GIT_PROTOCOL=version=1 under protocol.version=1, so a presence
+// check admits a v1 client into the v2 stateless pump. The relay-ssh findings
+// note records this being got wrong once already.
+const gitProtocolV2 = "version=2"
+
+// dispatch turns one exec into an outcome: parse it, gate it on v2, resolve the
+// repo to a decrypted PAT, and only then hand the bridge a Request.
+//
+// Every refusal here happens before the bridge is reached, and therefore before
+// any upstream contact — the no-network half of the fail-before-first-byte
+// invariant. The other half (the advertisement must return 2xx before a byte
+// reaches out) is the bridge's, in slice 3.
 func (s *Server) dispatch(ctx context.Context, ch ssh.Channel, fp, cmd, gitProtocol string) {
-	s.refuse(ch, fp, "", "", errDisallowedExec(), fmt.Errorf("exec %q: no dispatch yet", cmd))
+	op, repo, err := parseExec(cmd)
+	if err != nil {
+		s.refuse(ch, fp, "", "", errDisallowedExec(), err)
+		return
+	}
+
+	// Push has no v2 and bridges cleanly regardless, so the gate is fetch-only.
+	if op == opFetch && gitProtocol != gitProtocolV2 {
+		s.refuse(ch, fp, op, repo, errNotV2(),
+			fmt.Errorf("GIT_PROTOCOL = %q, want %q", gitProtocol, gitProtocolV2))
+		return
+	}
+
+	req, err := s.resolve(repo)
+	if err != nil {
+		s.refuse(ch, fp, op, repo, clientError(err), err)
+		return
+	}
+	if s.Bridge == nil {
+		s.refuse(ch, fp, op, repo, errInternal(), errors.New("no bridge configured"))
+		return
+	}
+
+	switch op {
+	case opFetch:
+		err = s.Bridge.Fetch(ctx, req, ch, ch)
+	case opPush:
+		err = s.Bridge.Push(ctx, req, ch, ch)
+	}
+	if err != nil {
+		// Streaming may already have started, in which case this cannot be
+		// clean: the client gets the message and a non-zero status, and the host
+		// log gets the detail.
+		s.refuse(ch, fp, op, repo, clientError(err), err)
+		return
+	}
+
+	ch.SendRequest("exit-status", false, ssh.Marshal(exitStatus{Status: 0}))
+	s.logger().Info("served", "fingerprint", fp, "op", op, "repo", repo)
+}
+
+// clientError maps an internal failure to what the client is told. A relayError
+// is already a row of the spec's table and passes through; anything else is a
+// host-side fault the client can do nothing about, so it becomes the internal
+// row and the real cause goes to the log.
+func clientError(err error) *relayError {
+	var re *relayError
+	if errors.As(err, &re) {
+		return re
+	}
+	return errInternal()
 }
 
 // refuse writes err's message to the channel's stderr and closes with its exit

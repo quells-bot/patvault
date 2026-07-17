@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -543,5 +544,279 @@ func TestServeFailsOnMissingAllowlist(t *testing.T) {
 
 	if err := s.Serve(context.Background(), ln); err == nil {
 		t.Fatal("Serve = nil error, want a startup error for a missing allowlist")
+	}
+}
+
+// fakeBridge records what dispatch handed it. In this slice its main job is to
+// fail the test when it is called at all: every refusal below must happen before
+// anything upstream would be contacted.
+type fakeBridge struct {
+	mu      sync.Mutex
+	fetched []Request
+	pushed  []Request
+	err     error
+}
+
+func (b *fakeBridge) Fetch(_ context.Context, req Request, _ io.Reader, out io.Writer) error {
+	b.mu.Lock()
+	b.fetched = append(b.fetched, req)
+	b.mu.Unlock()
+	if b.err != nil {
+		return b.err
+	}
+	_, _ = out.Write([]byte("0008fetch"))
+	return nil
+}
+
+func (b *fakeBridge) Push(_ context.Context, req Request, _ io.Reader, out io.Writer) error {
+	b.mu.Lock()
+	b.pushed = append(b.pushed, req)
+	b.mu.Unlock()
+	if b.err != nil {
+		return b.err
+	}
+	_, _ = out.Write([]byte("0007push"))
+	return nil
+}
+
+func (b *fakeBridge) calls() (fetched, pushed []Request) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]Request(nil), b.fetched...), append([]Request(nil), b.pushed...)
+}
+
+// v2Env is what a real git sends before a fetch exec under protocol.version=2.
+var v2Env = map[string]string{"GIT_PROTOCOL": "version=2"}
+
+// The decisive gate test. Git announces version=1 under protocol.version=1, so a
+// presence-only check would admit a v1 client into the v2 stateless pump. Each
+// case here is a value a real git was observed to send (relay-ssh spike).
+func TestDispatchV2GateComparesValue(t *testing.T) {
+	tests := []struct {
+		name    string
+		env     map[string]string
+		wantErr bool
+	}{
+		{"v2 passes the gate", map[string]string{"GIT_PROTOCOL": "version=2"}, false},
+		{"v1 is refused, not admitted", map[string]string{"GIT_PROTOCOL": "version=1"}, true},
+		{"v0 sends nothing and is refused", nil, true},
+		{"empty value is refused", map[string]string{"GIT_PROTOCOL": ""}, true},
+		{"a value merely containing version=2 is refused", map[string]string{"GIT_PROTOCOL": "version=2x"}, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			signer, allowedLine := newSigner(t)
+			s := newTestServer(t, allowedLine)
+			fb := &fakeBridge{}
+			s.Bridge = fb
+			storePAT(t, s.OpenDB, s.Keyring, "owner/repo", "ghp_live", nil)
+			addr := startRelay(t, s)
+
+			stderr, exit := runExec(t, addr, signer, tc.env, `git-upload-pack '/owner/repo.git'`)
+			fetched, _ := fb.calls()
+
+			if !tc.wantErr {
+				if len(fetched) != 1 {
+					t.Fatalf("bridge fetched %d times, want 1; stderr=%q", len(fetched), stderr)
+				}
+				if exit != 0 {
+					t.Errorf("exit = %d, want 0", exit)
+				}
+				return
+			}
+			want := "patvault: relay requires git wire protocol v2; run 'git config --global protocol.version 2' (default since git 2.26)"
+			if !strings.Contains(stderr, want) {
+				t.Errorf("stderr = %q, want it to contain %q", stderr, want)
+			}
+			if exit != 1 {
+				t.Errorf("exit = %d, want 1", exit)
+			}
+			if len(fetched) != 0 {
+				t.Errorf("bridge was called %d times for a refused fetch, want 0", len(fetched))
+			}
+		})
+	}
+}
+
+// Push has no v2, so the gate must not apply to it: git sends no GIT_PROTOCOL
+// before a receive-pack exec (relay-ssh spike).
+func TestDispatchPushNeedsNoV2(t *testing.T) {
+	signer, allowedLine := newSigner(t)
+	s := newTestServer(t, allowedLine)
+	fb := &fakeBridge{}
+	s.Bridge = fb
+	storePAT(t, s.OpenDB, s.Keyring, "owner/repo", "ghp_live", nil)
+	addr := startRelay(t, s)
+
+	_, exit := runExec(t, addr, signer, nil, `git-receive-pack '/owner/repo.git'`)
+	_, pushed := fb.calls()
+
+	if len(pushed) != 1 {
+		t.Fatalf("bridge pushed %d times, want 1", len(pushed))
+	}
+	if exit != 0 {
+		t.Errorf("exit = %d, want 0", exit)
+	}
+}
+
+// The bridge receives a fully-resolved Request: the normalized repo and the
+// decrypted PAT, with every check already passed.
+func TestDispatchHandsBridgeAResolvedRequest(t *testing.T) {
+	signer, allowedLine := newSigner(t)
+	s := newTestServer(t, allowedLine)
+	fb := &fakeBridge{}
+	s.Bridge = fb
+	storePAT(t, s.OpenDB, s.Keyring, "owner/repo", "ghp_the_token", nil)
+	addr := startRelay(t, s)
+
+	// The .git suffix and leading slash are the user's URL's, and normalize away.
+	if _, exit := runExec(t, addr, signer, v2Env, `git-upload-pack '/owner/repo.git'`); exit != 0 {
+		t.Fatalf("exit = %d, want 0", exit)
+	}
+	fetched, _ := fb.calls()
+	if len(fetched) != 1 {
+		t.Fatalf("bridge fetched %d times, want 1", len(fetched))
+	}
+	if fetched[0].Repo != "owner/repo" {
+		t.Errorf("Repo = %q, want %q", fetched[0].Repo, "owner/repo")
+	}
+	if fetched[0].PAT != "ghp_the_token" {
+		t.Errorf("PAT = %q, want the decrypted token", fetched[0].PAT)
+	}
+}
+
+// Every refusal below must happen before the bridge is reached: this is the
+// no-upstream-contacted half of fail-before-first-byte, and it is exactly what
+// makes this slice testable without an upstream.
+func TestDispatchRefusesBeforeReachingTheBridge(t *testing.T) {
+	tests := []struct {
+		name     string
+		env      map[string]string
+		cmd      string
+		wantMsg  string
+		wantExit int
+		setup    func(t *testing.T, s *Server)
+	}{
+		{
+			name:     "no stored PAT",
+			env:      v2Env,
+			cmd:      `git-upload-pack '/owner/never-added.git'`,
+			wantMsg:  "patvault: no token stored for github.com/owner/never-added; run 'patvault add' on the host — this will not succeed until then",
+			wantExit: 1,
+		},
+		{
+			name: "expired PAT",
+			env:  v2Env,
+			cmd:  `git-upload-pack '/owner/stale.git'`,
+			setup: func(t *testing.T, s *Server) {
+				past := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC).Unix()
+				storePAT(t, s.OpenDB, s.Keyring, "owner/stale", "ghp_stale", &past)
+			},
+			wantMsg:  "patvault: token for github.com/owner/stale expired 2026-07-01; run 'patvault add' on the host to refresh — this will not succeed until then",
+			wantExit: 1,
+		},
+		{
+			name:     "fetch without v2",
+			cmd:      `git-upload-pack '/owner/repo.git'`,
+			wantMsg:  "patvault: relay requires git wire protocol v2",
+			wantExit: 1,
+		},
+		{
+			name:     "upload-archive",
+			env:      v2Env,
+			cmd:      `git-upload-archive '/owner/repo.git'`,
+			wantMsg:  "patvault: only git fetch/push are permitted",
+			wantExit: 128,
+		},
+		{
+			name:     "unknown command",
+			env:      v2Env,
+			cmd:      `bash -c id`,
+			wantMsg:  "patvault: only git fetch/push are permitted",
+			wantExit: 128,
+		},
+		{
+			name:     "path traversal",
+			env:      v2Env,
+			cmd:      `git-upload-pack '/owner/../../etc/passwd'`,
+			wantMsg:  "patvault: only git fetch/push are permitted",
+			wantExit: 128,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			signer, allowedLine := newSigner(t)
+			s := newTestServer(t, allowedLine)
+			fb := &fakeBridge{}
+			s.Bridge = fb
+			storePAT(t, s.OpenDB, s.Keyring, "owner/repo", "ghp_live", nil)
+			if tc.setup != nil {
+				tc.setup(t, s)
+			}
+			addr := startRelay(t, s)
+
+			stderr, exit := runExec(t, addr, signer, tc.env, tc.cmd)
+			if !strings.Contains(stderr, tc.wantMsg) {
+				t.Errorf("stderr =\n%q\nwant it to contain\n%q", stderr, tc.wantMsg)
+			}
+			if exit != tc.wantExit {
+				t.Errorf("exit = %d, want %d", exit, tc.wantExit)
+			}
+			fetched, pushed := fb.calls()
+			if len(fetched) != 0 || len(pushed) != 0 {
+				t.Errorf("bridge was reached (%d fetch, %d push) for a refusal that precedes it",
+					len(fetched), len(pushed))
+			}
+		})
+	}
+}
+
+// A nil Bridge is slice 2's normal state. It must refuse rather than panic.
+func TestDispatchWithNoBridgeRefuses(t *testing.T) {
+	signer, allowedLine := newSigner(t)
+	s := newTestServer(t, allowedLine) // Bridge left nil
+	storePAT(t, s.OpenDB, s.Keyring, "owner/repo", "ghp_live", nil)
+	addr := startRelay(t, s)
+
+	stderr, exit := runExec(t, addr, signer, v2Env, `git-upload-pack '/owner/repo.git'`)
+	if !strings.Contains(stderr, "patvault: relay failed internally") {
+		t.Errorf("stderr = %q, want the internal-fault message", stderr)
+	}
+	if exit != 1 {
+		t.Errorf("exit = %d, want 1", exit)
+	}
+}
+
+// A host-side fault must not hand the client a message it cannot act on, and
+// must not leak the fault's detail.
+func TestDispatchMapsHostFaultToInternalError(t *testing.T) {
+	signer, allowedLine := newSigner(t)
+	s := newTestServer(t, allowedLine)
+	s.Bridge = &fakeBridge{}
+	s.OpenDB = func() (*db.DB, error) { return nil, errors.New("disk on fire") }
+	addr := startRelay(t, s)
+
+	stderr, exit := runExec(t, addr, signer, v2Env, `git-upload-pack '/owner/repo.git'`)
+	if !strings.Contains(stderr, "patvault: relay failed internally") {
+		t.Errorf("stderr = %q, want the internal-fault message", stderr)
+	}
+	if strings.Contains(stderr, "disk on fire") {
+		t.Errorf("stderr leaked the host-side cause: %q", stderr)
+	}
+	if exit != 1 {
+		t.Errorf("exit = %d, want 1", exit)
+	}
+}
+
+func TestClientErrorPassesRelayErrorsThrough(t *testing.T) {
+	re := errNotV2()
+	if got := clientError(re); got != re {
+		t.Errorf("clientError(relayError) = %v, want the same error back", got)
+	}
+	if got := clientError(fmt.Errorf("wrapped: %w", re)); got != re {
+		t.Errorf("clientError(wrapped relayError) = %v, want the unwrapped row", got)
+	}
+	if got := clientError(errors.New("db exploded")); got.Error() != errInternal().Error() {
+		t.Errorf("clientError(plain error) = %q, want the internal-fault message", got.Error())
 	}
 }
