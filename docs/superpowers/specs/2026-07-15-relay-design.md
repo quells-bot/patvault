@@ -264,6 +264,9 @@ patvault: relay requires git wire protocol v2; run 'git config --global protocol
 We control the guest, so this is a trivial constraint, and v2 is git's default
 since 2.26.
 
+Confirmed by the relay SSH spike against the local git/ssh binaries; see
+`docs/superpowers/notes/2026-07-16-relay-ssh-spike-findings.md`.
+
 **Push is unaffected.** `git-receive-pack` has no v2; a push is always one
 advertise-GET + one commands+packfile POST + a `report-status` reply, inherently
 single-shot, and bridges cleanly regardless of the negotiated version.
