@@ -504,6 +504,38 @@ authenticated by the agent's SSH key. Note the fail-before-first-byte checks
 - **reuse:** store/decrypt paths exercised through the existing `internal/db` /
   `internal/encrypt` tests; no new crypto.
 
+## Unverified assumptions (follow-ups before/during implementation)
+
+These are claims this spec makes that no live evidence supports yet. They are
+not deferred *features* — they are things believed true and never checked. The
+relay v2 spike (`docs/superpowers/notes/2026-07-16-relay-v2-spike-findings.md`)
+validated the v2 fetch protocol assumptions but falsified this spec's auth
+scheme, so "stated confidently, never tested" is a known failure mode here.
+
+- **Push against real GitHub is untested.** The spike covered `git-upload-pack`
+  only. "Push is unaffected ... bridges cleanly regardless of the negotiated
+  version" (§"Wire protocol") is unverified: the `git-receive-pack`
+  advertisement framing, the auth scheme on that endpoint, and the
+  commands+packfile POST / `report-status` round-trip have never touched
+  GitHub. A receive-pack `info/refs` GET against a throwaway private repo is a
+  read-only way to confirm the banner and auth; a real POST needs a repo that
+  can be written to. Settle this before `internal/relay` claims push support.
+- **The pack body has never been streamed end to end.** The spike stopped at the
+  `packfile` section header, so sideband pass-through (§"Cross-cutting bridge
+  rules"), the stream-never-buffer rule, and the fetch **section order** (whether
+  `shallow-info` precedes `packfile` under `deepen 1`) are all unobserved. The
+  bridge as specced does not interpret sections, so this is expected to be
+  covered by the stub-upstream and end-to-end tests in §Testing rather than by
+  another spike — but any code that comes to depend on section order needs its
+  own check first.
+- **The status→message mapping in §Errors is inferred, not observed.** The table
+  maps 401/403 and 404 to distinct messages, but those statuses come from
+  GitHub's *Git* transport, which does not behave like the REST API: an
+  unauthenticated private-repo advertisement returns **401** on the Git endpoint
+  where the API returns 404. Confirm each row's real status against the Git
+  endpoints (expired PAT, revoked PAT, no-access repo, nonexistent repo) rather
+  than reasoning from API behavior.
+
 ## Deferred to v2
 
 - Per-key → repo/permission authorization (an agent key scoped to a subset of
