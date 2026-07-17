@@ -3,12 +3,17 @@ package commands
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"golang.org/x/crypto/ssh"
+
+	"github.com/quells-bot/patvault/internal/db"
+	"github.com/quells-bot/patvault/internal/encrypt"
+	"github.com/quells-bot/patvault/internal/relay"
 )
 
 // Binding a credential-injecting relay wider than the host-only interface is the
@@ -129,5 +134,33 @@ func TestRelayServeRejectsWildcardListen(t *testing.T) {
 	cmd.SetArgs([]string{"serve", "--listen", "0.0.0.0:2222"})
 	if err := cmd.Execute(); err == nil {
 		t.Fatal("serve --listen 0.0.0.0:2222 = nil error, want a refusal")
+	}
+}
+
+// buildServeServer must wire a non-nil fetch Bridge pointed at GitHub, so that
+// 'patvault relay serve' does fetches out of the box. (Push refuses until slice
+// 4 — see relay.Bridge.Push.) The BaseURL is the one constant an operator must
+// not have to set.
+//
+// The OpenDB func and FileKeyring are built inline from the real db.Open and
+// encrypt.FileKeyring APIs (the same shape relay/server_test.go's newStore
+// uses), so the test depends on no fictitious helper.
+func TestBuildServeServerWiresFetchBridge(t *testing.T) {
+	dir := t.TempDir()
+	open := func() (*db.DB, error) { return db.Open(filepath.Join(dir, "test.db")) }
+	kr := encrypt.FileKeyring{Path: filepath.Join(dir, "master.key")}
+	srv := buildServeServer("/tmp/hostkey", "/tmp/authkeys", open, kr, slog.Default())
+	if srv.Bridge == nil {
+		t.Fatal("Bridge is nil; serve would refuse every fetch as an internal fault")
+	}
+	b, ok := any(srv.Bridge).(*relay.Bridge)
+	if !ok {
+		t.Fatalf("Bridge is %T, want *relay.Bridge", srv.Bridge)
+	}
+	if b.BaseURL != "https://github.com" {
+		t.Errorf("BaseURL = %q, want https://github.com", b.BaseURL)
+	}
+	if b.Client == nil {
+		t.Error("Client is nil")
 	}
 }

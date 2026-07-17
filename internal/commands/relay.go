@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"os/signal"
 	"syscall"
 
@@ -28,6 +29,25 @@ func NewRelayCmd(openDB func() (*db.DB, error), kr encrypt.Keyring, defaultHostK
 	return cmd
 }
 
+// buildServeServer constructs the relay Server for 'serve'. The Bridge is wired
+// here (not inline in RunE) so the wiring is unit-testable without running the
+// SSH server. BaseURL is the one forge the relay fronts; Client has no Timeout
+// so large pack transfers are not aborted mid-stream (cancellation is the
+// request context's job).
+func buildServeServer(hostKey, authKeys string, openDB func() (*db.DB, error), kr encrypt.Keyring, logger *slog.Logger) *relay.Server {
+	return &relay.Server{
+		HostKeyPath:  hostKey,
+		AuthKeysPath: authKeys,
+		OpenDB:       openDB,
+		Keyring:      kr,
+		Logger:       logger,
+		Bridge: &relay.Bridge{
+			Client:  &http.Client{},
+			BaseURL: "https://github.com",
+		},
+	}
+}
+
 func newRelayServeCmd(openDB func() (*db.DB, error), kr encrypt.Keyring, defaultHostKey, defaultAuthKeys string) *cobra.Command {
 	var listen, hostKey, authKeys string
 
@@ -43,16 +63,8 @@ func newRelayServeCmd(openDB func() (*db.DB, error), kr encrypt.Keyring, default
 				return fmt.Errorf("listen on %s: %w", listen, err)
 			}
 			defer ln.Close()
-
-			srv := &relay.Server{
-				HostKeyPath:  hostKey,
-				AuthKeysPath: authKeys,
-				OpenDB:       openDB,
-				Keyring:      kr,
-				Logger:       slog.New(slog.NewTextHandler(cmd.ErrOrStderr(), nil)),
-				// Bridge is nil until slice 3. Every request that passes the
-				// front door's checks is refused as an internal fault until then.
-			}
+			srv := buildServeServer(hostKey, authKeys, openDB, kr,
+				slog.New(slog.NewTextHandler(cmd.ErrOrStderr(), nil)))
 
 			ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
 			defer stop()
