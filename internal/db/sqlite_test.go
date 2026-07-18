@@ -1,8 +1,11 @@
 package db
 
 import (
+	"database/sql"
 	"path/filepath"
 	"testing"
+
+	_ "modernc.org/sqlite"
 )
 
 func newTestDB(t *testing.T) *DB {
@@ -120,5 +123,67 @@ func TestDeleteExpired(t *testing.T) {
 	rows, _ := d.List()
 	if len(rows) != 2 {
 		t.Fatalf("remaining rows = %d, want 2", len(rows))
+	}
+}
+
+func TestUpsertRoundTripsFingerprint(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	if err := d.Upsert(Credential{
+		Host: "github.com", Path: "owner/repo", PAT: []byte{1, 2, 3},
+		Fingerprint: "a1b2c3d4", TokenType: "github_pat", Created: 1000,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := d.Get("github.com", "owner/repo")
+	if err != nil || got == nil {
+		t.Fatalf("get: %v %v", got, err)
+	}
+	if got.Fingerprint != "a1b2c3d4" || got.TokenType != "github_pat" {
+		t.Fatalf("round-trip lost columns: %+v", got)
+	}
+	rows, err := d.List()
+	if err != nil || len(rows) != 1 || rows[0].Fingerprint != "a1b2c3d4" {
+		t.Fatalf("list lost columns: %+v %v", rows, err)
+	}
+}
+
+func TestMigrateAddsColumnsToOldDB(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.db")
+	// Build a pre-columns database by hand (the original 8-column schema).
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = raw.Exec(`CREATE TABLE credentials (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		host TEXT NOT NULL, path TEXT NOT NULL,
+		username TEXT NOT NULL DEFAULT '', pat BLOB NOT NULL,
+		label TEXT NOT NULL DEFAULT '', created INTEGER NOT NULL, expires INTEGER,
+		UNIQUE(host, path));`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`INSERT INTO credentials (host, path, pat, created)
+		VALUES ('github.com', 'owner/legacy', x'0102', 1000)`); err != nil {
+		t.Fatal(err)
+	}
+	raw.Close()
+
+	// Open through db.Open → migrate must ALTER in the new columns.
+	d, err := Open(path)
+	if err != nil {
+		t.Fatalf("open/migrate old db: %v", err)
+	}
+	defer d.Close()
+	got, err := d.Get("github.com", "owner/legacy")
+	if err != nil || got == nil {
+		t.Fatalf("legacy row unreadable after migrate: %v %v", got, err)
+	}
+	if got.Fingerprint != "" || got.TokenType != "" {
+		t.Fatalf("legacy row should have empty new columns, got %+v", got)
 	}
 }

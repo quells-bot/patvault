@@ -54,33 +54,78 @@ func (d *DB) integrityCheck(path string) error {
 }
 
 func (d *DB) migrate() error {
-	_, err := d.conn.Exec(`
+	if _, err := d.conn.Exec(`
 CREATE TABLE IF NOT EXISTS credentials (
-    id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    host      TEXT NOT NULL,
-    path      TEXT NOT NULL,
-    username  TEXT NOT NULL DEFAULT '',
-    pat       BLOB NOT NULL,
-    label     TEXT NOT NULL DEFAULT '',
-    created   INTEGER NOT NULL,
-    expires   INTEGER,
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    host        TEXT NOT NULL,
+    path        TEXT NOT NULL,
+    username    TEXT NOT NULL DEFAULT '',
+    pat         BLOB NOT NULL,
+    label       TEXT NOT NULL DEFAULT '',
+    created     INTEGER NOT NULL,
+    expires     INTEGER,
+    fingerprint TEXT NOT NULL DEFAULT '',
+    token_type  TEXT NOT NULL DEFAULT '',
     UNIQUE(host, path)
-);`)
-	return err
+);`); err != nil {
+		return err
+	}
+	// SQLite lacks ADD COLUMN IF NOT EXISTS; add each only when missing so
+	// pre-existing databases pick up the new columns.
+	for _, col := range []struct{ name, ddl string }{
+		{"fingerprint", "ALTER TABLE credentials ADD COLUMN fingerprint TEXT NOT NULL DEFAULT ''"},
+		{"token_type", "ALTER TABLE credentials ADD COLUMN token_type TEXT NOT NULL DEFAULT ''"},
+	} {
+		has, err := d.hasColumn(col.name)
+		if err != nil {
+			return err
+		}
+		if !has {
+			if _, err := d.conn.Exec(col.ddl); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (d *DB) hasColumn(name string) (bool, error) {
+	rows, err := d.conn.Query(`PRAGMA table_info(credentials)`)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			cid, notnull, pk int
+			cname, ctype     string
+			dflt             sql.NullString
+		)
+		if err := rows.Scan(&cid, &cname, &ctype, &notnull, &dflt, &pk); err != nil {
+			return false, err
+		}
+		if cname == name {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 // Upsert inserts or replaces the credential for (host, path).
 func (d *DB) Upsert(c Credential) error {
 	_, err := d.conn.Exec(`
-INSERT INTO credentials (host, path, username, pat, label, created, expires)
-VALUES (?, ?, ?, ?, ?, ?, ?)
+INSERT INTO credentials (host, path, username, pat, label, created, expires, fingerprint, token_type)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(host, path) DO UPDATE SET
     username = excluded.username,
     pat = excluded.pat,
     label = excluded.label,
     created = excluded.created,
-    expires = excluded.expires;`,
-		c.Host, c.Path, c.Username, c.PAT, c.Label, c.Created, c.Expires)
+    expires = excluded.expires,
+    fingerprint = excluded.fingerprint,
+    token_type = excluded.token_type;`,
+		c.Host, c.Path, c.Username, c.PAT, c.Label, c.Created, c.Expires,
+		c.Fingerprint, c.TokenType)
 	return err
 }
 
@@ -88,11 +133,12 @@ ON CONFLICT(host, path) DO UPDATE SET
 // nil if no row exists.
 func (d *DB) Get(host, path string) (*Credential, error) {
 	row := d.conn.QueryRow(
-		`SELECT id, host, path, username, pat, label, created, expires
+		`SELECT id, host, path, username, pat, label, created, expires, fingerprint, token_type
 		 FROM credentials WHERE host=? AND path=?`, host, path)
 	c := &Credential{}
 	var exp sql.NullInt64
-	err := row.Scan(&c.ID, &c.Host, &c.Path, &c.Username, &c.PAT, &c.Label, &c.Created, &exp)
+	err := row.Scan(&c.ID, &c.Host, &c.Path, &c.Username, &c.PAT, &c.Label,
+		&c.Created, &exp, &c.Fingerprint, &c.TokenType)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -108,7 +154,7 @@ func (d *DB) Get(host, path string) (*Credential, error) {
 // List returns all credentials ordered by host then path.
 func (d *DB) List() ([]Credential, error) {
 	rows, err := d.conn.Query(
-		`SELECT id, host, path, username, pat, label, created, expires
+		`SELECT id, host, path, username, pat, label, created, expires, fingerprint, token_type
 		 FROM credentials ORDER BY host, path`)
 	if err != nil {
 		return nil, err
@@ -118,7 +164,8 @@ func (d *DB) List() ([]Credential, error) {
 	for rows.Next() {
 		var c Credential
 		var exp sql.NullInt64
-		if err := rows.Scan(&c.ID, &c.Host, &c.Path, &c.Username, &c.PAT, &c.Label, &c.Created, &exp); err != nil {
+		if err := rows.Scan(&c.ID, &c.Host, &c.Path, &c.Username, &c.PAT, &c.Label,
+			&c.Created, &exp, &c.Fingerprint, &c.TokenType); err != nil {
 			return nil, err
 		}
 		if exp.Valid {
