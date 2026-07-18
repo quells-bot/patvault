@@ -1,16 +1,23 @@
 # patvault
 
-Encrypted credential helper for GitHub Personal Access Tokens.
+Encrypted GitHub PAT store with a credential-injecting git relay.
 
-`patvault` stores PATs in a SQLite database encrypted with AES-256-GCM, with the
-master key held in the OS keychain (or optionally a file). It implements the
-[git credential helper protocol][gh-cred] so git can retrieve tokens on demand
-without ever writing them to disk in plaintext.
+`patvault` lets an **untrusted agent** (a CI runner, a VM, a coding agent) use
+your GitHub repos over git **without ever holding a token**. The agent talks git
+over SSH to `patvault relay`, which injects the stored PAT on the HTTPS leg to
+GitHub. The agent authenticates with its own SSH key; the PAT never leaves the
+host. See [Relay](#relay).
+
+Under the hood, `patvault` stores PATs in a SQLite database encrypted with
+AES-256-GCM, with the master key held in the OS keychain (or optionally a file).
+It also implements the [git credential helper protocol][gh-cred], so on your own
+machine git can retrieve tokens on demand without ever writing them to disk in
+plaintext (see [Credential helper](#credential-helper)).
 
 The problem: embedding a PAT in the remote URL
 (`https://<token>@github.com/owner/repo`) bakes it into `.git/config`, shell
-history, and backups. `patvault` keeps the remote URL clean and the token
-encrypted.
+history, and backups — and handing that URL to an agent hands it the token.
+`patvault` keeps the remote URL clean and the token encrypted on the host.
 
 [gh-cred]: https://git-scm.com/docs/gitcredentials
 
@@ -59,7 +66,75 @@ Options:
 | `--ttl-days` | — | Fallback expiry in days when offline |
 | `--no-verify` | false | Skip online token verification |
 
-### 3. Register the git credential helper
+With tokens stored, use them via the [relay](#relay) (the primary use case) or
+the local [credential helper](#credential-helper).
+
+## Relay
+
+The **relay** lets an untrusted agent (a CI runner, a VM, a coding agent) use
+your GitHub repos over git **without ever holding a token**. Instead of the
+credential-helper flow, the agent talks git over SSH to `patvault relay`,
+which injects the stored PAT on the HTTPS leg to GitHub. The agent authenticates
+with its own SSH key; the PAT never leaves the host.
+
+```
+agent git ──ssh (agent key)──▶ patvault relay ──https (PAT)──▶ github.com
+```
+
+### Setup (on the host that holds the PATs)
+
+```bash
+# 1. Store the PAT for each repo the agent may use (patvault init + add, above).
+patvault add https://github.com/owner/repo
+
+# 2. Authorize the agent's SSH public key.
+patvault relay add-key ~/agent-keys/ci.pub
+
+# 3. Serve. Bind an explicit host-only interface IP (never a wildcard).
+patvault relay serve --listen 192.168.64.1:2222
+```
+
+The host key and allowlist default to `~/.config/patvault/` and persist across
+restarts. `serve` runs in the foreground until SIGINT/SIGTERM.
+
+### Use (on the agent)
+
+Configure the SSH client so the relay can be addressed by a stable alias, then
+point the remote at it — the URL carries no secret:
+
+```
+# agent ~/.ssh/config
+Host patvault
+  HostName 192.168.64.1      # the host's IP on the host-only network
+  Port 2222
+  IdentityFile ~/.ssh/agent_ed25519
+
+# remotes use the alias; the URL carries no secret
+git remote add origin patvault:owner/repo
+```
+
+Clone, fetch, and push through the alias (or the full `ssh://` URL):
+
+```bash
+git clone patvault:owner/repo.git
+# or, without the SSH-config alias:
+git clone ssh://git@192.168.64.1:2222/owner/repo.git
+git -C repo fetch
+git -C repo push
+```
+
+Requires git wire protocol v2 for fetch (`git config --global protocol.version 2`,
+the default since git 2.26). Supported transparently: clone, fetch, push
+(including shallow `--depth`, partial `--filter=blob:none`, force, tag, and
+branch-delete pushes). **Not** supported: git-LFS (its objects move over a
+separate HTTPS endpoint, not the git channel) and `git archive --remote`.
+
+## Credential helper
+
+On your own machine, `patvault` can act as a [git credential helper][gh-cred] so
+git retrieves stored tokens on demand — no relay, no SSH.
+
+### Register the git credential helper
 
 ```bash
 git config --global credential.helper '!patvault credential "$@"'
@@ -73,7 +148,7 @@ a space.
 git sends the repository path in credential requests, enabling per-repo
 matching.
 
-### 4. Push
+### Push
 
 ```bash
 git push
@@ -164,50 +239,6 @@ Append an agent's SSH public key to the relay's allowlist.
   keychain (or the `master.key` file in `--keychainless` mode).
 - **Path normalization**: trailing `.git` and `/` are stripped consistently on
   read and write so git's URL quirks don't cause mismatches.
-
-## Relay
-
-The **relay** lets an untrusted agent (a CI runner, a VM, a coding agent) use
-your GitHub repos over git **without ever holding a token**. Instead of the
-credential-helper flow above, the agent talks git over SSH to `patvault relay`,
-which injects the stored PAT on the HTTPS leg to GitHub. The agent authenticates
-with its own SSH key; the PAT never leaves the host.
-
-```
-agent git ──ssh (agent key)──▶ patvault relay ──https (PAT)──▶ github.com
-```
-
-### Setup (on the host that holds the PATs)
-
-```bash
-# 1. Store the PAT for each repo the agent may use (as above).
-patvault add https://github.com/owner/repo
-
-# 2. Authorize the agent's SSH public key.
-patvault relay add-key ~/agent-keys/ci.pub
-
-# 3. Serve. Bind an explicit host-only interface IP (never a wildcard).
-patvault relay serve --listen 192.168.64.1:2222
-```
-
-The host key and allowlist default to `~/.config/patvault/` and persist across
-restarts. `serve` runs in the foreground until SIGINT/SIGTERM.
-
-### Use (on the agent)
-
-Point the remote at the relay; the URL carries no secret:
-
-```bash
-git clone ssh://git@192.168.64.1:2222/owner/repo.git
-git -C repo fetch
-git -C repo push
-```
-
-Requires git wire protocol v2 for fetch (`git config --global protocol.version 2`,
-the default since git 2.26). Supported transparently: clone, fetch, push
-(including shallow `--depth`, partial `--filter=blob:none`, force, tag, and
-branch-delete pushes). **Not** supported: git-LFS (its objects move over a
-separate HTTPS endpoint, not the git channel) and `git archive --remote`.
 
 ## Target: fine-grained PATs
 
