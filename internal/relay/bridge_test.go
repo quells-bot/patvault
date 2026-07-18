@@ -78,6 +78,7 @@ func stubReceivePackAdvertisement() []byte {
 type stubReq struct {
 	auth, gitProto, accept, ctype string
 	chunked                       bool
+	contentLength                 int64
 	body                          []byte
 }
 
@@ -105,7 +106,7 @@ func newStubUpstream(t *testing.T, adv []byte, postResp func() io.Reader, getSta
 		rec := stubReq{
 			auth: r.Header.Get("Authorization"), gitProto: r.Header.Get("Git-Protocol"),
 			accept: r.Header.Get("Accept"), ctype: r.Header.Get("Content-Type"),
-			chunked: len(r.TransferEncoding) > 0, body: body,
+			chunked: len(r.TransferEncoding) > 0, contentLength: r.ContentLength, body: body,
 		}
 		s.mu.Unlock()
 		switch {
@@ -748,5 +749,128 @@ func TestPushDoesNotCloseTheClientChannel(t *testing.T) {
 	}
 	if ch.closeCalls != 0 {
 		t.Errorf("Push let net/http close the client channel %d time(s); in production that closes the aliased ssh.Channel before the report-status is written", ch.closeCalls)
+	}
+}
+
+// deleteCommands is a real delete-only receive-pack command list: one ref-update
+// whose new-oid is all zeros (a deletion), then a flush-pkt, and NO packfile.
+// The old-oid is a real sha; only new-oid = zeros marks the delete.
+func deleteCommands() []byte {
+	var b strings.Builder
+	writePkt(&b, "bf13b4419cf93eabd9b18d4ad9c2210a9268fdef "+
+		"0000000000000000000000000000000000000000 refs/heads/main\x00"+
+		"report-status side-band-64k object-format=sha1 agent=git/2.53.0-Linux")
+	writeFlush(&b)
+	return []byte(b.String())
+}
+
+// haltAfter yields data once, then blocks on every later Read until the test
+// ends — modeling a git client that sends a delete-only command list and does
+// NOT half-close its write side (the real 408-hang). A correct pushPack reads
+// only through the flush and never touches the blocked tail.
+type haltAfter struct {
+	data []byte
+	halt chan struct{}
+}
+
+func (r *haltAfter) Read(p []byte) (int, error) {
+	if len(r.data) > 0 {
+		n := copy(p, r.data)
+		r.data = r.data[n:]
+		return n, nil
+	}
+	<-r.halt
+	return 0, io.EOF
+}
+
+// A delete-only push sends no packfile, so the bridge must send the buffered
+// command list with a known Content-Length (not chunked) rather than wait for a
+// client EOF that never comes.
+func TestPushDeleteOnlySendsBufferedBodyWithContentLength(t *testing.T) {
+	report := []byte("000eunpack ok\n0019ok refs/heads/main\n0000")
+	stub := newStubUpstream(t, stubReceivePackAdvertisement(),
+		func() io.Reader { return bytes.NewReader(report) }, 0, 0)
+	b := &Bridge{Client: stub.Client(), BaseURL: stub.URL}
+
+	body := deleteCommands()
+	var out bytes.Buffer
+	if err := b.Push(context.Background(), Request{Repo: "owner/repo", PAT: "ghp_x"}, bytes.NewReader(body), &out); err != nil {
+		t.Fatalf("Push returned %v", err)
+	}
+	p := stub.recordedPosts()[0]
+	if p.chunked {
+		t.Error("delete-only push was chunked; it must be sent with a known Content-Length")
+	}
+	if p.contentLength != int64(len(body)) {
+		t.Errorf("Content-Length = %d, want %d (buffered command list)", p.contentLength, len(body))
+	}
+	if !bytes.Equal(p.body, body) {
+		t.Errorf("POST body = %q, want the delete command list %q", p.body, body)
+	}
+	want := append(stripBanner(stubReceivePackAdvertisement()), report...)
+	if !bytes.Equal(out.Bytes(), want) {
+		t.Errorf("out = %q, want advertisement + report-status", out.Bytes())
+	}
+}
+
+// The 408-hang regression guard: a delete-only push must complete even when the
+// client never EOFs its write side. With the pre-fix code (passing `in` straight
+// to net/http) this deadlocks; the fix reads only through the flush.
+func TestPushDeleteOnlyDoesNotWaitForClientEOF(t *testing.T) {
+	stub := newStubUpstream(t, stubReceivePackAdvertisement(),
+		func() io.Reader { return bytes.NewReader([]byte("000eunpack ok\n0000")) }, 0, 0)
+	b := &Bridge{Client: stub.Client(), BaseURL: stub.URL}
+
+	halt := make(chan struct{})
+	defer close(halt)
+	in := &haltAfter{data: deleteCommands(), halt: halt}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- b.Push(context.Background(), Request{Repo: "owner/repo", PAT: "ghp_x"}, in, io.Discard)
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Push returned %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Push blocked waiting for a client EOF on a delete-only push (the 408-hang bug)")
+	}
+}
+
+func TestAllDeletions(t *testing.T) {
+	create := func() []byte { // a non-delete command (new-oid non-zero), no pack in this fixture
+		var b strings.Builder
+		writePkt(&b, "0000000000000000000000000000000000000000 "+
+			"bf13b4419cf93eabd9b18d4ad9c2210a9268fdef refs/heads/main\x00report-status")
+		writeFlush(&b)
+		return []byte(b.String())
+	}
+	mixed := func() []byte {
+		var b strings.Builder
+		writePkt(&b, "aaaa000000000000000000000000000000000000 "+
+			"0000000000000000000000000000000000000000 refs/heads/gone\x00report-status")
+		writePkt(&b, "aaaa000000000000000000000000000000000000 "+
+			"bf13b4419cf93eabd9b18d4ad9c2210a9268fdef refs/heads/main")
+		writeFlush(&b)
+		return []byte(b.String())
+	}
+	tests := []struct {
+		name string
+		in   []byte
+		want bool
+	}{
+		{"single delete", deleteCommands(), true},
+		{"single create", create(), false},
+		{"delete + create mixed", mixed(), false},
+		{"empty", nil, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := allDeletions(tc.in); got != tc.want {
+				t.Errorf("allDeletions() = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

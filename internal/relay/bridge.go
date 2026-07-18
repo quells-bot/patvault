@@ -50,34 +50,62 @@ func (b *Bridge) Push(ctx context.Context, req Request, in io.Reader, out io.Wri
 // pushPack streams the client's ref-update commands + packfile to
 // git-receive-pack and streams the report-status back verbatim.
 //
-// The body is the client's stream copied until EOF: git sends commands + flush +
-// a raw (un-pkt-line-framed) packfile and then half-closes its write side, so the
-// bridge never parses the pack. A delete-only push (commands + flush, no pack) is
-// the same code path. The body length is unknown until EOF, so the POST goes out
-// chunked (ContentLength = -1) — the same framing in production (an ssh.Channel
-// body) and in tests (a *bytes.Reader body), and what git's own remote-curl
-// sends. See docs/superpowers/notes/2026-07-16-relay-push-framing-probe.md.
+// A normal push sends commands + flush + a raw (un-pkt-line-framed) packfile
+// and then half-closes its write side, so the bridge never parses the pack —
+// it streams from the client's EOF, chunked (length unknown up front). A
+// delete-only push sends only commands + flush and NO packfile, and git does
+// NOT half-close its write side for it: waiting for `in` to reach EOF would
+// hang until GitHub times out the request (observed: 408). readCommand reads
+// the command list up to its flush-pkt with no read-ahead, so `in` is left
+// positioned exactly at the packfile if one follows; when every command is a
+// deletion (new-oid all zeros), the buffered commands are the whole body and
+// are sent with a known Content-Length instead. See
+// docs/superpowers/notes/2026-07-16-relay-push-framing-probe.md.
 //
 // The report-status reply — possibly sideband-framed (side-band-64k) and possibly
 // carrying `ng` rejection lines — is pumped to out untouched. Reframing it breaks
 // the client outright ("bad band"); pass-through is the whole job.
 func (b *Bridge) pushPack(ctx context.Context, req Request, in io.Reader, out io.Writer) error {
-	// io.NopCloser is load-bearing, not decoration. In production in and out are
-	// the SAME aliased ssh.Channel (server.go dispatch hands ch as both). A real
-	// ssh.Channel is an io.ReadWriteCloser, so if it were passed as the body
-	// directly, net/http would use it as the request's ReadCloser and call
-	// Body.Close() after sending the body — closing the channel's read AND write
-	// halves before we write the report-status back to out. The client then sees
-	// "unexpected disconnect while reading sideband packet". Wrapping in a
-	// non-Closer keeps net/http from closing the channel; dispatch owns ch.Close().
-	// See docs/superpowers/notes/2026-07-17-relay-slice-3-channel-aliasing.md.
+	// Read the ref-update command list up to its terminating flush-pkt.
+	// readCommand reads exact lengths (no read-ahead), so on return `in` is
+	// positioned exactly at the packfile, if one follows. Per readCommand's own
+	// contract, io.EOF here means "no more commands" (an empty-request or a
+	// closed stream), not a failure — the same signal pumpCommands' fetch loop
+	// treats as a clean end. Only a non-EOF error (a genuine truncation) is
+	// fatal.
+	commands, err := readCommand(in)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return fmt.Errorf("read push commands: %w", err)
+	}
+
+	// Decide whether a packfile follows. A delete-only push (every command's
+	// new-oid is all zeros) sends no pack — and git does NOT half-close its write
+	// side for it, so waiting for `in` to reach EOF would hang until GitHub times
+	// out the request (observed: 408). For an all-delete request the body is
+	// complete at the flush: send the buffered commands with a known
+	// Content-Length. Otherwise a pack follows — stream it from `in` to the
+	// client's post-pack EOF, chunked (length unknown up front).
+	//
+	// Neither bytes.Reader nor io.MultiReader is an io.Closer, so net/http cannot
+	// close the aliased ssh.Channel (in and out are the same channel; dispatch
+	// owns ch.Close()). See
+	// docs/superpowers/notes/2026-07-17-relay-slice-3-channel-aliasing.md.
+	var body io.Reader
+	var contentLength int64
+	if allDeletions(commands) {
+		body = bytes.NewReader(commands)
+		contentLength = int64(len(commands))
+	} else {
+		body = io.MultiReader(bytes.NewReader(commands), in)
+		contentLength = -1
+	}
+
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		b.endpoint(req, "git-receive-pack"), io.NopCloser(in))
+		b.endpoint(req, "git-receive-pack"), body)
 	if err != nil {
 		return fmt.Errorf("build receive-pack request: %w", err)
 	}
-	// Force chunked: the length is unknown until the client's EOF.
-	httpReq.ContentLength = -1
+	httpReq.ContentLength = contentLength
 	setUpstreamHeaders(httpReq, req, "application/x-git-receive-pack-request")
 	httpReq.Header.Set("Accept", "application/x-git-receive-pack-result")
 
@@ -94,6 +122,53 @@ func (b *Bridge) pushPack(ctx context.Context, req Request, in io.Reader, out io
 		return fmt.Errorf("copy report-status: %w", err)
 	}
 	return nil
+}
+
+// allDeletions reports whether every ref-update command in a receive-pack
+// command list is a deletion — new-oid all zeros — which means no packfile
+// follows. It parses only the small, text command list (never the pack): each
+// command is "<old-oid> <new-oid> <ref>", with the first also carrying
+// "\0<capabilities>". A malformed or empty list returns false, so the bridge
+// falls back to streaming a pack rather than truncating one.
+func allDeletions(commandList []byte) bool {
+	r := bytes.NewReader(commandList)
+	sawCommand := false
+	for {
+		payload, kind, err := readPacket(r)
+		if err != nil {
+			break
+		}
+		if kind != pktData {
+			continue
+		}
+		line := payload
+		if i := bytes.IndexByte(line, 0); i >= 0 {
+			line = line[:i] // drop "\0<capabilities>" on the first command
+		}
+		fields := bytes.Fields(line)
+		if len(fields) < 2 {
+			return false
+		}
+		sawCommand = true
+		if !isZeroOID(fields[1]) {
+			return false
+		}
+	}
+	return sawCommand
+}
+
+// isZeroOID reports whether oid is a non-empty run of ASCII '0' — the all-zeros
+// object id git uses for "no such object" (the new-oid of a deletion).
+func isZeroOID(oid []byte) bool {
+	if len(oid) == 0 {
+		return false
+	}
+	for _, c := range oid {
+		if c != '0' {
+			return false
+		}
+	}
+	return true
 }
 
 // Fetch runs the v2 stateless-rpc pump: the advertisement GET (banner+flush
