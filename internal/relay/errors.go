@@ -94,10 +94,12 @@ func errInternal() *relayError {
 }
 
 // errGitHubAuth is the 401/403 row: GitHub rejected the token. The wording is
-// the base spec's §"Errors and exit codes" table, copied verbatim. The spec
-// marks this status→message mapping as inferred, not observed (§"Unverified
-// assumptions"); slice 5 confirms it against the real Git endpoints. The repo is
-// formatted bare (no host prefix) — the message already names "github".
+// the base spec's §"Errors and exit codes" table, copied verbatim. Confirmed
+// against the real Git endpoints (see
+// docs/superpowers/notes/2026-07-18-relay-slice-5-real-github-findings.md): an
+// unauthenticated request to a private repo returns 401 on the Git transport,
+// and a revoked or insufficient-scope token maps here. The repo is formatted
+// bare (no host prefix) — the message already names "github".
 func errGitHubAuth(repo string) *relayError {
 	return &relayError{
 		msg: fmt.Sprintf(

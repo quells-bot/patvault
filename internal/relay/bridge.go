@@ -320,9 +320,11 @@ func setUpstreamHeaders(req *http.Request, r Request, contentType string) {
 	req.Header.Set("User-Agent", "git/2.43.0")
 }
 
-// classifyStatus maps a non-2xx upstream status to the spec's error table. The
-// table marks this mapping as inferred rather than observed (§"Unverified
-// assumptions"); slice 5 confirms each row against the real Git endpoints.
+// classifyStatus maps a non-2xx upstream status to the spec's error table.
+// Confirmed against the real Git endpoints (see
+// docs/superpowers/notes/2026-07-18-relay-slice-5-real-github-findings.md): a
+// nonexistent (and, per GitHub's existence-hiding, a no-access) repo returns
+// 404, an unauthenticated/rejected token returns 401/403, and 5xx is transient.
 func classifyStatus(repo string, status int) *relayError {
 	switch {
 	case status == http.StatusUnauthorized || status == http.StatusForbidden:
