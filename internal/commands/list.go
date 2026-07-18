@@ -76,11 +76,6 @@ func runList(d *db.DB, kr encrypt.Keyring, out io.Writer, show, prune bool) erro
 	return tw.Flush()
 }
 
-// patPrefixes are GitHub's token-type prefixes, longest first so github_pat_
-// matches before any shorter prefix. Fine-grained tokens (github_pat_) are the
-// first-class case, so we must not stop at the first underscore.
-var patPrefixes = []string{"github_pat_", "ghp_", "gho_", "ghu_", "ghs_", "ghr_"}
-
 // maskPAT shows the token-type prefix plus ****, e.g. github_pat_****.
 func maskPAT(pat string) string {
 	for _, p := range patPrefixes {
