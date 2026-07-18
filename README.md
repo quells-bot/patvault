@@ -1,9 +1,11 @@
 # patvault
 
-Encrypted GitHub PAT store with a credential-injecting git relay.
+Encrypted GitHub Personal Access Token (PAT) store with a credential-injecting
+git relay.
 
-`patvault` lets an **untrusted agent** (a CI runner, a VM, a coding agent) use
-your GitHub repos over git **without ever holding a token**. The agent talks git
+`patvault` lets an **untrusted agent** (a continuous-integration runner, a
+virtual machine, a coding agent) use your GitHub repos over git **without ever
+holding a token**. The agent talks git
 over SSH to `patvault relay`, which injects the stored PAT on the HTTPS leg to
 GitHub. The agent authenticates with its own SSH key; the PAT never leaves the
 host. See [Relay](#relay).
@@ -126,7 +128,8 @@ git -C repo push
 Requires git wire protocol v2 for fetch (`git config --global protocol.version 2`,
 the default since git 2.26). Supported transparently: clone, fetch, push
 (including shallow `--depth`, partial `--filter=blob:none`, force, tag, and
-branch-delete pushes). **Not** supported: git-LFS (its objects move over a
+branch-delete pushes). **Not** supported: git Large File Storage (git-LFS; its
+objects move over a
 separate HTTPS endpoint, not the git channel) and `git archive --remote`.
 
 ## Credential helper
