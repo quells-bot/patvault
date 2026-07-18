@@ -89,16 +89,34 @@ disk.
 
 Store a PAT for a GitHub repository URL. Must be `https://github.com/owner/repo`.
 
-### `patvault list [--show] [--prune]`
+### `patvault list [--prune] [--refresh-fingerprints]`
 
-List stored credentials. PATs are masked by default (`github_pat_****`);
-`--show` reveals them. `--prune` deletes expired entries.
+List stored credentials. Tokens are **never** printed — each row shows a keyed,
+non-reversible **fingerprint** and the token **type**. `--prune` deletes expired
+entries. `--refresh-fingerprints` is a one-time migration aid that decrypts every
+row to backfill missing fingerprints (the only `list` path that decrypts).
+
+Rows stored before fingerprints existed show `(legacy)` until a `patvault add`,
+`git credential get/store`, or `--refresh-fingerprints` upgrades them.
 
 ```
-  Host         Path                          Username      Expires     PAT
-  github.com   quells-bot/patvault           quells-bot    ⚠ 5 days   github_pat_****
-  github.com   another-org/some-repo         quells-bot    89 days     github_pat_****
-  github.com   old-org/legacy                quells-bot    (expired)  github_pat_****
+  Host         Path                    Username     Type        Fingerprint  Expires
+  github.com   quells-bot/patvault     quells-bot   github_pat  a1b2c3d4     ⚠ 5 days
+  github.com   another-org/some-repo   quells-bot   github_pat  a1b2c3d4     89 days
+  github.com   old-org/legacy          quells-bot   ghp         9f8e7d6c     (expired)
+```
+
+(The repeated `a1b2c3d4` shows one token reused across two repos.)
+
+### `patvault fingerprint`
+
+Read a token on stdin and print its fingerprint under the current master key, to
+check whether a token you hold is already stored (find it in `list`'s Fingerprint
+column) — without revealing the secret.
+
+```
+printf '%s' "$COPIED_TOKEN" | patvault fingerprint
+a1b2c3d4
 ```
 
 ### `patvault remove <repo-url>`

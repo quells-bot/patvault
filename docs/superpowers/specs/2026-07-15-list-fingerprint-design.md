@@ -1,6 +1,6 @@
 # Patvault: Hardening the `list` Command
 
-Status: proposed
+Status: accepted (implemented 2026-07-18)
 Date: 2026-07-15
 Supersedes: the `--show` behavior described in the original patvault design.
 
