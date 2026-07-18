@@ -113,6 +113,14 @@ Initialize the master key. Run once before adding credentials.
 
 Git credential helper protocol implementation. Invoked by git, not by the user.
 
+### `patvault relay serve [--listen <ip:port>] [--authorized-keys <path>] [--host-key <path>]`
+
+Run the credential-injecting git relay in the foreground (see [Relay](#relay)).
+
+### `patvault relay add-key <path-to-pubkey>`
+
+Append an agent's SSH public key to the relay's allowlist.
+
 ## How it works
 
 ```
@@ -138,6 +146,50 @@ Git credential helper protocol implementation. Invoked by git, not by the user.
   keychain (or the `master.key` file in `--keychainless` mode).
 - **Path normalization**: trailing `.git` and `/` are stripped consistently on
   read and write so git's URL quirks don't cause mismatches.
+
+## Relay
+
+The **relay** lets an untrusted agent (a CI runner, a VM, a coding agent) use
+your GitHub repos over git **without ever holding a token**. Instead of the
+credential-helper flow above, the agent talks git over SSH to `patvault relay`,
+which injects the stored PAT on the HTTPS leg to GitHub. The agent authenticates
+with its own SSH key; the PAT never leaves the host.
+
+```
+agent git ──ssh (agent key)──▶ patvault relay ──https (PAT)──▶ github.com
+```
+
+### Setup (on the host that holds the PATs)
+
+```bash
+# 1. Store the PAT for each repo the agent may use (as above).
+patvault add https://github.com/owner/repo
+
+# 2. Authorize the agent's SSH public key.
+patvault relay add-key ~/agent-keys/ci.pub
+
+# 3. Serve. Bind an explicit host-only interface IP (never a wildcard).
+patvault relay serve --listen 192.168.64.1:2222
+```
+
+The host key and allowlist default to `~/.config/patvault/` and persist across
+restarts. `serve` runs in the foreground until SIGINT/SIGTERM.
+
+### Use (on the agent)
+
+Point the remote at the relay; the URL carries no secret:
+
+```bash
+git clone ssh://git@192.168.64.1:2222/owner/repo.git
+git -C repo fetch
+git -C repo push
+```
+
+Requires git wire protocol v2 for fetch (`git config --global protocol.version 2`,
+the default since git 2.26). Supported transparently: clone, fetch, push
+(including shallow `--depth`, partial `--filter=blob:none`, force, tag, and
+branch-delete pushes). **Not** supported: git-LFS (its objects move over a
+separate HTTPS endpoint, not the git channel) and `git archive --remote`.
 
 ## Target: fine-grained PATs
 

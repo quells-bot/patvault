@@ -464,6 +464,7 @@ today. `patvault credential …` remains for non-relay use.
 | `internal/relay/bridge.go` | v2 stateless-rpc pump + single-shot push bridge; pkt-line framing scanner; `# service=` strip; PAT injection; streamed copy; sideband pass-through |
 | `internal/relay/authkeys.go` | Load/append the OpenSSH-format allowlist |
 | `internal/relay/pktline.go` | Minimal pkt-line length-prefix scanner (flush/delim boundary detection) |
+| `internal/relay/errors.go` | The condition → (message, exit code, retryable) error table; one constructor per row of §"Errors and exit codes" |
 | `internal/commands/relay.go` | `patvault relay serve` / `add-key` cobra wiring |
 | `internal/encrypt`, `internal/db`, `internal/urlparse` | **reused unchanged** — store, decrypt, and normalize |
 

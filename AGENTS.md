@@ -12,6 +12,16 @@ history, and backups. patvault keeps the URL clean and the token encrypted.
 First-class target: **fine-grained per-repo PATs**. Classic (account-wide) PATs
 are not a design target.
 
+**Second subsystem — the relay** (`internal/relay/`, `patvault relay`). A
+credential-injecting git transport: it serves the agent's git over SSH and
+bridges it to GitHub over HTTPS, injecting a stored PAT upstream so the agent
+never holds the token. The agent authenticates to the relay with its own SSH key
+(allowlisted); the relay resolves the repo to a stored PAT, does the HTTP smart
+protocol to GitHub with the PAT as Basic auth, and pumps pkt-lines between the
+SSH channel and the HTTP bodies without interpreting them. Design:
+`docs/superpowers/specs/2026-07-15-relay-design.md`; real-GitHub verification:
+`docs/superpowers/notes/2026-07-18-relay-slice-5-real-github-findings.md`.
+
 ## Architecture & Data Flow
 
 Layered bottom-up, each package with one responsibility:
@@ -48,6 +58,21 @@ Layered bottom-up, each package with one responsibility:
 - Encryption: AES-256-GCM, random 12-byte nonce prepended to ciphertext.
 - Storage: `nonce || ciphertext || tag` in SQLite BLOB column.
 
+**Data flow: git through the relay (`patvault relay serve`):**
+
+1. Agent's git runs `ssh git@relay git-upload-pack 'owner/repo'` (or
+   `git-receive-pack` for push); the agent's key must be in the allowlist.
+2. `server.go` authenticates the pubkey, captures `GIT_PROTOCOL`, and dispatches
+   the exec; `exec.go` shell-unquotes and validates it (fetch/push only).
+3. The repo is resolved to a stored PAT (reusing `internal/db` / `internal/encrypt`);
+   an expired or missing PAT is refused before any upstream call.
+4. `bridge.go` speaks the v2 smart-HTTP protocol to `github.com`, injecting the
+   PAT as Basic `x-access-token`, and pumps pkt-lines both ways verbatim (fetch:
+   advertisement GET + a POST per client command; push: advertisement GET + one
+   commands+pack POST, chunked, streamed to the client's EOF).
+5. **Fail-before-first-byte:** no byte reaches the client until the upstream
+   advertisement returns 2xx; refusals go to stderr + a non-zero exit, never stdout.
+
 ## Key Directories
 
 | Path | Purpose |
@@ -59,7 +84,8 @@ Layered bottom-up, each package with one responsibility:
 | `internal/github/` | Online PAT verification via GitHub REST API |
 | `internal/gitconfig/` | Git config management (`useHttpPath`) |
 | `internal/urlparse/` | URL parsing and path normalization |
-| `docs/superpowers/` | Design spec and implementation plan |
+| `internal/relay/` | Credential-injecting SSH→HTTPS git relay (`server`, `exec`, `bridge`, `pktline`, `authkeys`, `errors`) |
+| `docs/superpowers/` | Design specs (`specs/`) and verification findings notes (`notes/`) |
 
 ## Development Commands
 
@@ -182,6 +208,11 @@ Applied in `credential get`, `credential store`, `credential erase`, `add`,
 | `internal/github/verify.go` | `Verifier` interface, `HTTPVerifier`, `ErrAuthFailed` |
 | `internal/gitconfig/gitconfig.go` | `Runner` interface, `EnsureUseHTTPPath` |
 | `internal/urlparse/urlparse.go` | `ParseRepoURL`, `NormalizePath` |
+| `internal/relay/server.go` | SSH front door: host key, allowlist auth, `GIT_PROTOCOL` capture, exec dispatch, PAT resolution |
+| `internal/relay/bridge.go` | The pkt-line ↔ HTTPS pump: `Bridge.Fetch` / `Bridge.Push`, banner strip, PAT injection, chunked push |
+| `internal/relay/exec.go` | `parseExec`: shell-unquote, fetch/push allowlist, `owner/repo` normalization |
+| `internal/relay/errors.go` | `relayError` table — one constructor per row of the client-facing error/exit-code table |
+| `internal/commands/relay.go` | `patvault relay serve` / `add-key` cobra wiring |
 
 ## Runtime/Tooling Preferences
 
