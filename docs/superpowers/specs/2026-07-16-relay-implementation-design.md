@@ -162,24 +162,21 @@ And two things nothing may depend on, because they were never observed:
 
 ## Open items
 
-The base spec's §"Unverified assumptions" has three live bullets. One of them —
-**"the pack body has never been streamed end to end"** (sideband pass-through,
-stream-never-buffer, fetch section order) — is closed by **slices 3 and 4**, not
-by slice 5: the base spec already routes it to the stub-upstream and end-to-end
-tests rather than to another spike, and those are exactly slices 3 and 4's gates.
+**All SETTLED (2026-07-18)** — see
+`docs/superpowers/notes/2026-07-18-relay-slice-5-real-github-findings.md`. The
+base spec's §"Unverified assumptions" had three live bullets; all are now closed:
 
-The remaining two are slice 5's job, and neither blocks slices 1–4:
-
-- **GitHub accepting a chunked receive-pack request body.** The push body length
-  is unknown up front, so it goes out chunked. `remote-curl` uses chunked for
-  large pushes, so this is expected to work. If it is rejected, the bridge must
-  buffer the pack to compute a `Content-Length` — in tension with "stream, never
-  buffer", and a real design change rather than a tweak.
-- **The status→message mapping.** The live runs only ever produced 200 and 401.
-  Much of the matrix (nonexistent repo, no-access repo, malformed token) is
-  probeable with *no* credential; only the expired-vs-revoked distinction needs a
-  PAT lifecycle, and since both plausibly return 401 that distinction may not be
-  actionable.
+- **The pack body streamed end to end** — closed by slices 3–4's gates and the
+  slice-5 real-GitHub run (real clone/fetch/push stream real packs, sideband
+  report-status forwarded verbatim).
+- **GitHub accepting a chunked receive-pack request body** — **accepted.** A real
+  push through the relay went out chunked and succeeded; no buffering fallback was
+  needed. (Slice 5 did surface an unrelated delete-only-push bug — git does not
+  half-close for a no-pack push, so the relay now sends an all-delete command list
+  with a known `Content-Length`; fixed and re-verified.)
+- **The status→message mapping** — observed 200 / 401 / 404; `classifyStatus`
+  matches the table as-is. The revoked-vs-expired distinction stays non-actionable
+  (both map to the same auth message; an expired PAT is refused locally).
 
 ## Non-goals
 

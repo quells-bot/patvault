@@ -537,29 +537,28 @@ scheme, so "stated confidently, never tested" is a known failure mode here.
   push sends no pack at all**, so the bridge must not assume pack bytes follow
   the commands; and the `report-status` **rejection (`ng`) path is still
   unobserved** — every command in that run succeeded.
-- **The pack body has never been streamed end to end.** The spike stopped at the
-  `packfile` section header, so sideband pass-through (§"Cross-cutting bridge
-  rules"), the stream-never-buffer rule, and the fetch **section order** (whether
-  `shallow-info` precedes `packfile` under `deepen 1`) are all unobserved. The
-  bridge as specced does not interpret sections, so this is expected to be
-  covered by the stub-upstream and end-to-end tests in §Testing rather than by
-  another spike — but any code that comes to depend on section order needs its
-  own check first.
-- **GitHub accepting a chunked receive-pack request body is unverified.** The
-  push bridge cannot know the body length up front (the client's EOF is what
-  ends it), so the POST goes out with `Transfer-Encoding: chunked`. git's own
-  `remote-curl` uses chunked for large pushes, so this is expected to work, but
-  the push spike sent a fixed-length body and the live repo/PAT are gone. Fold
-  the check into the real-GitHub end-to-end run. If GitHub rejects it, the bridge
-  must buffer the pack to compute a `Content-Length`, in tension with §"Stream,
-  never buffer". See `docs/superpowers/notes/2026-07-16-relay-push-framing-probe.md`.
-- **The status→message mapping in §Errors is inferred, not observed.** The table
-  maps 401/403 and 404 to distinct messages, but those statuses come from
-  GitHub's *Git* transport, which does not behave like the REST API: an
-  unauthenticated private-repo advertisement returns **401** on the Git endpoint
-  where the API returns 404. Confirm each row's real status against the Git
-  endpoints (expired PAT, revoked PAT, no-access repo, nonexistent repo) rather
-  than reasoning from API behavior.
+- ~~**The pack body has never been streamed end to end.**~~ **SETTLED
+  (2026-07-18)** — closed by slices 3–4's stub-upstream and end-to-end gates and
+  the slice-5 real-GitHub run (see
+  `docs/superpowers/notes/2026-07-18-relay-slice-5-real-github-findings.md`). Real
+  `git clone` / incremental `git fetch` / `git push` through the relay stream real
+  packfiles with sideband report-status forwarded verbatim; the bridge never
+  buffers a pack (except a delete-only push, which has no pack). The bridge does
+  not interpret sections, so fetch section order remains a non-dependency.
+- ~~**GitHub accepting a chunked receive-pack request body is unverified.**~~
+  **SETTLED (2026-07-18)** — same note. A real `git push` through the relay was
+  accepted with a `Transfer-Encoding: chunked` body; the `remote-curl` expectation
+  held, and `pushPack` streams chunked unchanged. (A delete-only push is the one
+  case that does not go out chunked: it carries no pack, git does not half-close,
+  so the relay sends the buffered command list with a known `Content-Length` — see
+  the findings note and `internal/relay/bridge.go`.)
+- ~~**The status→message mapping in §Errors is inferred, not observed.**~~
+  **SETTLED (2026-07-18)** — same note. Observed on the Git endpoints: accessible
+  repo **200**, unauthenticated private repo **401**, nonexistent repo **404**.
+  `classifyStatus`'s rows match as-is (401/403 → auth, 404 → not-found, 5xx →
+  unreachable). The no-access-repo and revoked-vs-expired distinctions were not
+  separately reproduced (one repo + one token); both map to the same message and
+  action, and an expired PAT never reaches GitHub (the relay refuses it locally).
 
 ## Deferred to v2
 
