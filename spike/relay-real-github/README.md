@@ -36,4 +36,6 @@ confirms GitHub accepts the relay's chunked receive-pack body.
 
 ## After the run
 
-Delete the PAT and the throwaway repo. Confirm no token literal is in the tree.
+Delete the PAT and the throwaway repo — or, if it is a persistent private
+fixture you keep for this purpose, leave it and just clean up any scratch
+branches the run created. Either way, confirm no token literal is in the tree.

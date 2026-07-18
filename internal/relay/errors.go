@@ -94,12 +94,12 @@ func errInternal() *relayError {
 }
 
 // errGitHubAuth is the 401/403 row: GitHub rejected the token. The wording is
-// the base spec's §"Errors and exit codes" table, copied verbatim. Confirmed
-// against the real Git endpoints (see
-// docs/superpowers/notes/2026-07-18-relay-slice-5-real-github-findings.md): an
-// unauthenticated request to a private repo returns 401 on the Git transport,
-// and a revoked or insufficient-scope token maps here. The repo is formatted
-// bare (no host prefix) — the message already names "github".
+// the base spec's §"Errors and exit codes" table, copied verbatim. The slice-5
+// run (docs/superpowers/notes/2026-07-18-relay-slice-5-real-github-findings.md)
+// observed 401 for an unauthenticated request to a private repo; a revoked or
+// insufficient-scope token (403) was not separately elicited but maps to the same
+// auth row and the same client action. The repo is formatted bare (no host
+// prefix) — the message already names "github".
 func errGitHubAuth(repo string) *relayError {
 	return &relayError{
 		msg: fmt.Sprintf(
@@ -113,7 +113,8 @@ func errGitHubAuth(repo string) *relayError {
 // errGitHubNotFound is the 404 row: the repo does not exist, or the token cannot
 // see it. GitHub's Git endpoint returns 404 for both a missing repo and a
 // private repo the token lacks access to — the same existence-hiding ambiguity
-// the REST API uses.
+// the REST API uses. The slice-5 run observed 404 for a nonexistent repo; the
+// no-access case was not separately reproduced (see the slice-5 findings note).
 func errGitHubNotFound(repo string) *relayError {
 	return &relayError{
 		msg: fmt.Sprintf(

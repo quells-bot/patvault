@@ -724,11 +724,13 @@ func TestPushDoesNotLoopbackClientBytes(t *testing.T) {
 
 // countingChannel is an io.ReadWriteCloser that records Close() calls, standing
 // in for the ssh.Channel Push receives in production, where in and out are the
-// SAME channel. It guards the io.NopCloser wrap in pushPack: if that wrap were
-// removed, net/http would use this channel as the request body's ReadCloser and
-// Close() it after the send — closing the aliased channel before the
-// report-status is written. The *bytes.Reader used by the other push tests is not
-// an io.Closer, so it cannot catch this; only a real Closer can.
+// SAME channel. It guards the invariant that pushPack never lets net/http close
+// the client channel: pushPack builds the request body from a *bytes.Reader or an
+// io.MultiReader (neither an io.Closer), so net/http cannot reach ch.Close(). If a
+// future change passed the channel to net/http as an io.ReadCloser instead, the
+// transport would Close() it after the send — tearing down the aliased channel
+// before the report-status is written. The *bytes.Reader the other push tests use
+// is not an io.Closer, so it cannot catch that regression; only a real Closer can.
 type countingChannel struct {
 	io.Reader
 	closeCalls int

@@ -139,7 +139,7 @@ func allDeletions(commandList []byte) bool {
 			break
 		}
 		if kind != pktData {
-			continue
+			continue // the terminal flush-pkt readCommand left on the list
 		}
 		line := payload
 		if i := bytes.IndexByte(line, 0); i >= 0 {
@@ -321,10 +321,13 @@ func setUpstreamHeaders(req *http.Request, r Request, contentType string) {
 }
 
 // classifyStatus maps a non-2xx upstream status to the spec's error table.
-// Confirmed against the real Git endpoints (see
+// Partly observed against the real Git endpoints (see
 // docs/superpowers/notes/2026-07-18-relay-slice-5-real-github-findings.md): a
-// nonexistent (and, per GitHub's existence-hiding, a no-access) repo returns
-// 404, an unauthenticated/rejected token returns 401/403, and 5xx is transient.
+// nonexistent repo returns 404 and an unauthenticated request returns 401. The
+// 403 and no-access-repo → 404 branches were not separately elicited by that run;
+// they carry the spec's inferred disposition (a rejected token maps to the same
+// auth row; GitHub's existence-hiding returns 404 for a no-access repo). 5xx is
+// transient.
 func classifyStatus(repo string, status int) *relayError {
 	switch {
 	case status == http.StatusUnauthorized || status == http.StatusForbidden:
