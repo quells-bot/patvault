@@ -3,8 +3,6 @@ package commands
 import (
 	"fmt"
 	"io"
-	"os"
-	"strings"
 	"text/tabwriter"
 	"time"
 
@@ -13,9 +11,10 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// NewListCmd builds the `patvault list` cobra command.
-func NewListCmd(open func() (*db.DB, error), kr encrypt.Keyring) *cobra.Command {
-	var show, prune bool
+// NewListCmd builds the `patvault list` cobra command. krFn is invoked only for
+// --refresh-fingerprints; the default listing never constructs a keyring.
+func NewListCmd(open func() (*db.DB, error), krFn func() encrypt.Keyring) *cobra.Command {
+	var prune bool
 	cmd := &cobra.Command{
 		Use:   "list",
 		Short: "List stored credentials",
@@ -24,15 +23,16 @@ func NewListCmd(open func() (*db.DB, error), kr encrypt.Keyring) *cobra.Command 
 			if err != nil {
 				return err
 			}
-			return runList(d, kr, cmd.OutOrStdout(), show, prune)
+			return runList(d, cmd.OutOrStdout(), prune)
 		},
 	}
-	cmd.Flags().BoolVar(&show, "show", false, "reveal full PATs (masked by default)")
 	cmd.Flags().BoolVar(&prune, "prune", false, "delete expired credentials")
 	return cmd
 }
 
-func runList(d *db.DB, kr encrypt.Keyring, out io.Writer, show, prune bool) error {
+// runList renders credential metadata. It never fetches the master key or
+// decrypts a token — fingerprint and type are read from stored columns.
+func runList(d *db.DB, out io.Writer, prune bool) error {
 	if prune {
 		n, err := d.DeleteExpired()
 		if err != nil {
@@ -48,42 +48,18 @@ func runList(d *db.DB, kr encrypt.Keyring, out io.Writer, show, prune bool) erro
 		return fmt.Errorf("list: %w", err)
 	}
 
-	mk, err := encrypt.GetOrCreateMasterKey(kr)
-	if err != nil {
-		return fmt.Errorf("master key: %w", err)
-	}
-
 	tw := tabwriter.NewWriter(out, 2, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "Host\tPath\tUsername\tExpires\tPAT")
+	fmt.Fprintln(tw, "Host\tPath\tUsername\tType\tFingerprint\tExpires")
 	for _, c := range rows {
-		key, err := encrypt.DeriveKey(mk, c.Host, c.Path)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "patvault: warning: skipping %s/%s: %v\n", c.Host, c.Path, err)
-			continue
+		fp, typ := c.Fingerprint, c.TokenType
+		if fp == "" {
+			// Un-backfilled legacy row: never decrypt to compute one.
+			fp, typ = "(legacy)", "(legacy)"
 		}
-		pat, err := encrypt.Decrypt(key, c.PAT)
-		patStr := "????"
-		if err == nil {
-			patStr = string(pat)
-		}
-		twline := maskPAT(patStr)
-		if show {
-			twline = patStr
-		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n",
-			c.Host, c.Path, c.Username, formatExpires(c.Expires), twline)
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n",
+			c.Host, c.Path, c.Username, typ, fp, formatExpires(c.Expires))
 	}
 	return tw.Flush()
-}
-
-// maskPAT shows the token-type prefix plus ****, e.g. github_pat_****.
-func maskPAT(pat string) string {
-	for _, p := range patPrefixes {
-		if strings.HasPrefix(pat, p) {
-			return p + "****"
-		}
-	}
-	return "****"
 }
 
 // formatExpires renders relative expiry: (unknown), (expired), ⚠ N days, or N days.

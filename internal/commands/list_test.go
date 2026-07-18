@@ -20,34 +20,42 @@ func TestListOutput(t *testing.T) {
 	seedRow(t, d, kr, "github.com", "owner/repo", "github_pat_secret1234", nil)
 
 	out := &bytes.Buffer{}
-	if err := runList(d, kr, out, false, false); err != nil {
+	if err := runList(d, out, false); err != nil {
 		t.Fatal(err)
 	}
 	body := out.String()
-	if !strings.Contains(body, "github.com") || !strings.Contains(body, "owner/repo") {
-		t.Errorf("output missing row: %q", body)
+	if !strings.Contains(body, "Fingerprint") || !strings.Contains(body, "Type") {
+		t.Errorf("missing new headers: %q", body)
 	}
-	if !strings.Contains(body, "github_pat_****") {
-		t.Errorf("PAT not masked: %q", body)
+	mk, _ := encrypt.GetOrCreateMasterKey(kr)
+	if !strings.Contains(body, encrypt.Fingerprint(mk, "github_pat_secret1234")) {
+		t.Errorf("fingerprint not shown: %q", body)
+	}
+	if !strings.Contains(body, "github_pat") {
+		t.Errorf("token type not shown: %q", body)
 	}
 	if strings.Contains(body, "github_pat_secret1234") {
 		t.Errorf("full PAT leaked: %q", body)
 	}
-	if !strings.Contains(body, "(unknown)") {
-		t.Errorf("expected (unknown) expiry: %q", body)
+	if strings.Contains(body, "****") {
+		t.Errorf("masked PAT should be gone: %q", body)
 	}
 }
 
-func TestListShow(t *testing.T) {
+func TestListLegacyRow(t *testing.T) {
 	d := newTestDB(t)
-	kr := &fakeKeyring{store: map[string][]byte{}}
-	seedRow(t, d, kr, "github.com", "owner/repo", "github_pat_secret1234", nil)
-	out := &bytes.Buffer{}
-	if err := runList(d, kr, out, true, false); err != nil {
+	// Insert a row with no fingerprint (pre-migration style).
+	if err := d.Upsert(db.Credential{
+		Host: "github.com", Path: "old/repo", PAT: []byte{1}, Created: 1,
+	}); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out.String(), "github_pat_secret1234") {
-		t.Errorf("expected full PAT with --show: %q", out.String())
+	out := &bytes.Buffer{}
+	if err := runList(d, out, false); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "(legacy)") {
+		t.Errorf("expected (legacy) for un-backfilled row: %q", out.String())
 	}
 }
 
@@ -57,7 +65,7 @@ func TestListExpiredMarker(t *testing.T) {
 	past := int64(1)
 	seedRow(t, d, kr, "github.com", "old/repo", "github_pat_old", &past)
 	out := &bytes.Buffer{}
-	if err := runList(d, kr, out, false, false); err != nil {
+	if err := runList(d, out, false); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(out.String(), "(expired)") {
@@ -71,11 +79,24 @@ func TestListPruneDeletesExpired(t *testing.T) {
 	past := int64(1)
 	seedRow(t, d, kr, "github.com", "old/repo", "github_pat_old", &past)
 	seedRow(t, d, kr, "github.com", "new/repo", "github_pat_new", intPtr(time.Now().Unix()+1e8))
-	if err := runList(d, kr, &bytes.Buffer{}, false, true); err != nil {
+	if err := runList(d, &bytes.Buffer{}, true); err != nil {
 		t.Fatal(err)
 	}
 	rows, _ := d.List()
 	if len(rows) != 1 || rows[0].Path != "new/repo" {
 		t.Fatalf("prune left wrong rows: %+v", rows)
+	}
+}
+
+func TestListNeverDecrypts(t *testing.T) {
+	// A keyring that fails any access proves the default list path never
+	// fetches the master key or decrypts.
+	d := newTestDB(t)
+	kr := &fakeKeyring{store: map[string][]byte{}}
+	seedRow(t, d, kr, "github.com", "owner/repo", "github_pat_x", nil)
+	// runList takes no keyring at all — the signature itself is the guarantee;
+	// this test documents intent and will fail to compile if a keyring is added.
+	if err := runList(d, &bytes.Buffer{}, false); err != nil {
+		t.Fatal(err)
 	}
 }

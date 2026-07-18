@@ -84,7 +84,7 @@ func buildAddCmd() *cobra.Command {
 }
 
 func buildListCmd() *cobra.Command {
-	return commands.NewListCmd(openDB, selectKeyring())
+	return commands.NewListCmd(openDB, selectKeyring)
 }
 
 func buildRemoveCmd() *cobra.Command {
