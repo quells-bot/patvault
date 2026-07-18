@@ -61,6 +61,11 @@ exfiltrate a reusable GitHub credential, because none ever crosses the boundary.
   fetches (see "Wire protocol: require v2 for fetch"). Supporting v0 fetches
   would mean building a stateful↔stateless negotiation engine, which is
   deliberately out of scope.
+- **No git-LFS.** Large File Storage objects transfer over a *separate* HTTPS
+  batch API, not the `git-upload-pack`/`git-receive-pack` channel the relay
+  bridges. A repo clones through the relay, but its LFS-pointed blobs would not
+  resolve (the LFS transfer never reaches the SSH channel). Supporting LFS would
+  mean bridging a second protocol on a second endpoint — out of scope for v1.
 - **No bundled front-end.** v1 ships `patvault relay serve`, a foreground
   server. A menu-bar / GUI wrapper (for explicit lifecycle and one-click token
   refresh) is a possible later addition, specced separately; the relay core is

@@ -141,6 +141,25 @@ delete push against real GitHub, with the PAT never leaking to the client. The
 base spec's §"Unverified assumptions" chunked and status→message bullets are now
 observed and can be marked SETTLED.
 
+## Additional operation coverage (2026-07-18)
+
+The relay bridges exactly two SSH services (`git-upload-pack`, `git-receive-pack`),
+so every git network operation is a variation of those. Beyond clone / incremental
+fetch / push / delete, these were spot-checked through a real relay against real
+GitHub to confirm the pump is transparent for their differing request/response
+shapes (the delete bug showed "works for free" needs checking):
+
+| Operation | Result |
+|---|---|
+| **Force push** (`--force`, non-fast-forward) | **PASS** — plain non-ff push correctly rejected (GitHub's rejection pumped to the client), `--force` accepted and the remote ref moved to the divergent commit. v1 is transparent (force-push denial is deferred to v2). |
+| **Shallow clone** (`--depth 1`) | **PASS** — cloned with 1 commit, `is-shallow-repository = true`; the `shallow-info` section pumped correctly. |
+| **Partial clone** (`--filter=blob:none`) | **PASS** — cloned with the filter recorded, and the working-tree checkout's **lazy on-demand blob fetch** succeeded through the relay (a second upload-pack shape: fetch-by-specific-object). |
+
+No code changes were needed — all three pump transparently. `git-LFS` is **not**
+supported (its objects move over a separate HTTPS batch API, not the SSH channel;
+now a documented v1 non-goal), and `git-upload-archive` is refused by design
+(`errDisallowedExec`).
+
 ## Disposition
 
 `quells-bot/patvault-test` and its PAT are the maintainer's persistent fixtures
