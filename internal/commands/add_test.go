@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/quells-bot/patvault/internal/encrypt"
 	"github.com/quells-bot/patvault/internal/github"
 )
 
@@ -123,6 +124,29 @@ func TestAddNoVerifySkipsVerification(t *testing.T) {
 	}
 	if got.Expires != nil {
 		t.Errorf("expires = %v, want nil", got.Expires)
+	}
+}
+
+func TestAddPopulatesFingerprintAndType(t *testing.T) {
+	d := newTestDB(t)
+	kr := &fakeKeyring{store: map[string][]byte{}}
+	v := &fakeVerifier{}
+	r := &fakeGitRunner{}
+	const tok = "github_pat_secret1234"
+	if err := runAdd(d, kr, v, r, bytes.NewBufferString(tok+"\n"),
+		"https://github.com/owner/repo", "", 0, true); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := d.Get("github.com", "owner/repo")
+	if got == nil {
+		t.Fatal("row not stored")
+	}
+	if got.TokenType != "github_pat" {
+		t.Errorf("token_type = %q, want github_pat", got.TokenType)
+	}
+	mk, _ := encrypt.GetOrCreateMasterKey(kr)
+	if want := encrypt.Fingerprint(mk, tok); got.Fingerprint != want {
+		t.Errorf("fingerprint = %q, want %q", got.Fingerprint, want)
 	}
 }
 

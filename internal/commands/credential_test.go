@@ -56,6 +56,8 @@ func seed(t *testing.T, d *db.DB, kr encrypt.Keyring, host, path, pat string, ex
 	if err := d.Upsert(db.Credential{
 		Host: host, Path: path, Username: "owner", PAT: blob,
 		Label: host + "/" + path, Created: 1000, Expires: expires,
+		Fingerprint: encrypt.Fingerprint(mk, pat),
+		TokenType:   tokenType(pat),
 	}); err != nil {
 		t.Fatal(err)
 	}

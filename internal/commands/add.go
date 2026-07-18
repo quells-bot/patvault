@@ -104,6 +104,8 @@ func runAdd(d *db.DB, kr encrypt.Keyring, v github.Verifier, r gitconfig.Runner,
 	if err := d.Upsert(db.Credential{
 		Host: host, Path: path, Username: username, PAT: blob,
 		Label: label, Created: time.Now().Unix(), Expires: expires,
+		Fingerprint: encrypt.Fingerprint(mk, pat),
+		TokenType:   tokenType(pat),
 	}); err != nil {
 		return fmt.Errorf("store: %w", err)
 	}
