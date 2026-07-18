@@ -88,6 +88,30 @@ func TestListPruneDeletesExpired(t *testing.T) {
 	}
 }
 
+func TestRefreshFingerprintsBackfills(t *testing.T) {
+	d := newTestDB(t)
+	kr := &fakeKeyring{store: map[string][]byte{}}
+	// Legacy row: encrypted but no stored fingerprint.
+	mk, _ := encrypt.GetOrCreateMasterKey(kr)
+	key, _ := encrypt.DeriveKey(mk, "github.com", "owner/repo")
+	blob, _ := encrypt.Encrypt(key, []byte("github_pat_legacy"))
+	if err := d.Upsert(db.Credential{Host: "github.com", Path: "owner/repo", PAT: blob, Created: 1}); err != nil {
+		t.Fatal(err)
+	}
+
+	out := &bytes.Buffer{}
+	if err := runRefreshFingerprints(d, kr, out); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "warning") {
+		t.Errorf("expected a warning about decryption: %q", out.String())
+	}
+	got, _ := d.Get("github.com", "owner/repo")
+	if got.Fingerprint != encrypt.Fingerprint(mk, "github_pat_legacy") || got.TokenType != "github_pat" {
+		t.Fatalf("row not backfilled: %+v", got)
+	}
+}
+
 func TestListNeverDecrypts(t *testing.T) {
 	// A keyring that fails any access proves the default list path never
 	// fetches the master key or decrypts.
