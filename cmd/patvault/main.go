@@ -26,6 +26,7 @@ func main() {
 	root.AddCommand(buildRemoveCmd())
 	root.AddCommand(buildCredentialCmd())
 	root.AddCommand(buildRelayCmd())
+	root.AddCommand(buildFingerprintCmd())
 
 	if err := root.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -150,6 +151,10 @@ func defaultRelayAuthKeysPath() string {
 
 func buildRelayCmd() *cobra.Command {
 	return commands.NewRelayCmd(openDB, selectKeyring(), defaultRelayHostKeyPath(), defaultRelayAuthKeysPath())
+}
+
+func buildFingerprintCmd() *cobra.Command {
+	return commands.NewFingerprintCmd(selectKeyring())
 }
 
 // exitCode maps a credential handler's numeric exit code onto cobra's RunE
