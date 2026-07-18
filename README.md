@@ -213,9 +213,15 @@ Git credential helper protocol implementation. Invoked by git, not by the user.
 
 Run the credential-injecting git relay in the foreground (see [Relay](#relay)).
 
-### `patvault relay add-key <path-to-pubkey>`
+### `patvault relay add-key [path-to-pubkey]`
 
-Append an agent's SSH public key to the relay's allowlist.
+Append an agent's SSH public key to the relay's allowlist. With no path
+argument the key is read from stdin, so a key on the clipboard can be piped
+straight in:
+
+```bash
+pbpaste | patvault relay add-key
+```
 
 ## How it works
 

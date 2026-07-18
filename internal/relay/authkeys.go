@@ -63,9 +63,16 @@ func appendAuthorizedKey(allowlistPath, pubkeyFile string) (added bool, err erro
 	if err != nil {
 		return false, fmt.Errorf("read public key: %w", err)
 	}
+	return appendAuthorizedKeyData(allowlistPath, data, pubkeyFile)
+}
+
+// appendAuthorizedKeyData is appendAuthorizedKey's core, parameterized over the
+// already-read key bytes so the key can come from a file or from stdin. source
+// labels the origin for the parse error only.
+func appendAuthorizedKeyData(allowlistPath string, data []byte, source string) (added bool, err error) {
 	key, comment, _, _, err := ssh.ParseAuthorizedKey(data)
 	if err != nil {
-		return false, fmt.Errorf("parse public key %s: %w", pubkeyFile, err)
+		return false, fmt.Errorf("parse public key %s: %w", source, err)
 	}
 
 	existing, err := os.ReadFile(allowlistPath)
@@ -119,6 +126,14 @@ func appendAuthorizedKey(allowlistPath, pubkeyFile string) (added bool, err erro
 // appendAuthorizedKey for 'patvault relay add-key'.
 func AddKey(allowlistPath, pubkeyFile string) (added bool, err error) {
 	return appendAuthorizedKey(allowlistPath, pubkeyFile)
+}
+
+// AddKeyData appends the already-read public key bytes to the allowlist at
+// allowlistPath, reporting whether it was new. It is the exported face of
+// appendAuthorizedKeyData for 'patvault relay add-key' reading from stdin;
+// source labels the origin for the parse error only.
+func AddKeyData(allowlistPath string, data []byte, source string) (added bool, err error) {
+	return appendAuthorizedKeyData(allowlistPath, data, source)
 }
 
 // isBlankOrComment reports whether a line carries no key.

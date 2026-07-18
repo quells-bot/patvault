@@ -3,6 +3,7 @@ package commands
 import (
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -83,11 +84,28 @@ func newRelayAddKeyCmd(defaultAuthKeys string) *cobra.Command {
 	var authKeys string
 
 	cmd := &cobra.Command{
-		Use:   "add-key <path-to-pubkey>",
+		Use:   "add-key [path-to-pubkey]",
 		Short: "append an agent's public key to the allowlist",
-		Args:  cobra.ExactArgs(1),
+		Long: "Append an agent's public key to the allowlist.\n\n" +
+			"With no path argument the key is read from stdin, so a key on the\n" +
+			"clipboard can be piped straight in:\n\n" +
+			"    pbpaste | patvault relay add-key",
+		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			added, err := relay.AddKey(authKeys, args[0])
+			var (
+				added bool
+				err   error
+			)
+			if len(args) == 1 {
+				added, err = relay.AddKey(authKeys, args[0])
+			} else {
+				var data []byte
+				data, err = io.ReadAll(cmd.InOrStdin())
+				if err != nil {
+					return fmt.Errorf("read public key from stdin: %w", err)
+				}
+				added, err = relay.AddKeyData(authKeys, data, "stdin")
+			}
 			if err != nil {
 				return err
 			}
