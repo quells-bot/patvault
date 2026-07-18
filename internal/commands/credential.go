@@ -73,6 +73,12 @@ func RunGet(in io.Reader, out io.Writer, errOut io.Writer, d *db.DB, kr encrypt.
 		return 1
 	}
 
+	// Lazily upgrade a legacy row: it just proved it can decrypt, so store the
+	// fingerprint for free. Best-effort — never fail a credential get on it.
+	if cred.Fingerprint == "" {
+		_ = d.UpdateFingerprint(host, path, encrypt.Fingerprint(mk, string(pat)), tokenType(string(pat)))
+	}
+
 	username := m["username"]
 	if username == "" {
 		username = cred.Username
@@ -148,6 +154,8 @@ func RunStore(in io.Reader, errOut io.Writer, d *db.DB, kr encrypt.Keyring) int 
 	if err := d.Upsert(db.Credential{
 		Host: host, Path: path, Username: username, PAT: blob,
 		Label: label, Created: time.Now().Unix(), Expires: nil,
+		Fingerprint: encrypt.Fingerprint(mk, password),
+		TokenType:   tokenType(password),
 	}); err != nil {
 		fmt.Fprintln(errOut, "patvault: upsert:", err)
 		return 1

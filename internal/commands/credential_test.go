@@ -207,3 +207,42 @@ func TestRunEraseIdempotent(t *testing.T) {
 		t.Fatalf("code = %d, want 0", code)
 	}
 }
+
+func TestRunStorePopulatesFingerprint(t *testing.T) {
+	d := newTestDB(t)
+	kr := &fakeKeyring{store: map[string][]byte{}}
+	in := strings.NewReader("protocol=https\nhost=github.com\npath=owner/repo\nusername=u\npassword=github_pat_stored\n")
+	if code := RunStore(in, &bytes.Buffer{}, d, kr); code != 0 {
+		t.Fatalf("code = %d", code)
+	}
+	got, _ := d.Get("github.com", "owner/repo")
+	if got == nil || got.TokenType != "github_pat" {
+		t.Fatalf("token_type not set: %+v", got)
+	}
+	mk, _ := encrypt.GetOrCreateMasterKey(kr)
+	if got.Fingerprint != encrypt.Fingerprint(mk, "github_pat_stored") {
+		t.Fatalf("fingerprint mismatch: %q", got.Fingerprint)
+	}
+}
+
+func TestRunGetBackfillsLegacyFingerprint(t *testing.T) {
+	d := newTestDB(t)
+	kr := &fakeKeyring{store: map[string][]byte{}}
+	// Seed a legacy row: encrypted, but no fingerprint stored.
+	mk, _ := encrypt.GetOrCreateMasterKey(kr)
+	key, _ := encrypt.DeriveKey(mk, "github.com", "owner/repo")
+	blob, _ := encrypt.Encrypt(key, []byte("github_pat_legacy"))
+	_ = d.Upsert(db.Credential{Host: "github.com", Path: "owner/repo", PAT: blob, Created: 1})
+
+	in := strings.NewReader("protocol=https\nhost=github.com\npath=owner/repo\n")
+	if code := RunGet(in, &bytes.Buffer{}, &bytes.Buffer{}, d, kr); code != 0 {
+		t.Fatalf("code = %d", code)
+	}
+	got, _ := d.Get("github.com", "owner/repo")
+	if got.Fingerprint != encrypt.Fingerprint(mk, "github_pat_legacy") {
+		t.Fatalf("get did not backfill fingerprint: %q", got.Fingerprint)
+	}
+	if got.TokenType != "github_pat" {
+		t.Fatalf("get did not backfill token_type: %q", got.TokenType)
+	}
+}

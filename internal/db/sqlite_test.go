@@ -187,3 +187,19 @@ func TestMigrateAddsColumnsToOldDB(t *testing.T) {
 		t.Fatalf("legacy row should have empty new columns, got %+v", got)
 	}
 }
+
+func TestUpdateFingerprint(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	_ = d.Upsert(Credential{Host: "github.com", Path: "o/r", PAT: []byte{9}, Created: 1})
+	if err := d.UpdateFingerprint("github.com", "o/r", "zz11zz11", "ghp"); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := d.Get("github.com", "o/r")
+	if got.Fingerprint != "zz11zz11" || got.TokenType != "ghp" {
+		t.Fatalf("update failed: %+v", got)
+	}
+}

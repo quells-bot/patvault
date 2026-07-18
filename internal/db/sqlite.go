@@ -129,6 +129,15 @@ ON CONFLICT(host, path) DO UPDATE SET
 	return err
 }
 
+// UpdateFingerprint sets the fingerprint and token_type for an existing row.
+// Used by lazy backfill (credential get) and by list --refresh-fingerprints.
+func (d *DB) UpdateFingerprint(host, path, fingerprint, tokenType string) error {
+	_, err := d.conn.Exec(
+		`UPDATE credentials SET fingerprint=?, token_type=? WHERE host=? AND path=?`,
+		fingerprint, tokenType, host, path)
+	return err
+}
+
 // Get returns the credential for (host, path) without filtering on expiry, or
 // nil if no row exists.
 func (d *DB) Get(host, path string) (*Credential, error) {
