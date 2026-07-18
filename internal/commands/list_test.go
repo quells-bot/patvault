@@ -113,13 +113,13 @@ func TestRefreshFingerprintsBackfills(t *testing.T) {
 }
 
 func TestListNeverDecrypts(t *testing.T) {
-	// A keyring that fails any access proves the default list path never
-	// fetches the master key or decrypts.
+	// The guarantee that list never decrypts is structural, not runtime:
+	// runList takes no keyring, so it cannot fetch the master key or decrypt.
+	// This test exercises the default path and, together with the signature,
+	// fails to compile if a keyring is ever reintroduced.
 	d := newTestDB(t)
 	kr := &fakeKeyring{store: map[string][]byte{}}
 	seedRow(t, d, kr, "github.com", "owner/repo", "github_pat_x", nil)
-	// runList takes no keyring at all — the signature itself is the guarantee;
-	// this test documents intent and will fail to compile if a keyring is added.
 	if err := runList(d, &bytes.Buffer{}, false); err != nil {
 		t.Fatal(err)
 	}
