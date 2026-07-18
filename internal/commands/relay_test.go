@@ -99,6 +99,39 @@ func TestRelayAddKeyAppendsAndDeduplicates(t *testing.T) {
 	}
 }
 
+// With no path argument the key is read from stdin, so a key sitting on the
+// clipboard can be piped straight in (`pbpaste | patvault relay add-key`).
+func TestRelayAddKeyReadsStdin(t *testing.T) {
+	dir := t.TempDir()
+	pubFile := newPubKeyFile(t, dir)
+	pub, err := os.ReadFile(pubFile)
+	if err != nil {
+		t.Fatalf("read pubkey: %v", err)
+	}
+	allowlist := filepath.Join(dir, "relay_authorized_keys")
+
+	cmd := NewRelayCmd(nil, nil, filepath.Join(dir, "host_key"), allowlist)
+	var out strings.Builder
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	cmd.SetIn(strings.NewReader(string(pub)))
+	cmd.SetArgs([]string{"add-key"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("add-key from stdin: %v", err)
+	}
+	if got := out.String(); !strings.Contains(got, "added") {
+		t.Errorf("add-key from stdin said %q, want it to report the key was added", got)
+	}
+
+	data, err := os.ReadFile(allowlist)
+	if err != nil {
+		t.Fatalf("read allowlist: %v", err)
+	}
+	if n := len(strings.Fields(strings.TrimSpace(string(data)))); n != 2 {
+		t.Errorf("allowlist = %q, want exactly one key line (type + base64)", data)
+	}
+}
+
 func TestRelayAddKeyRejectsNonKey(t *testing.T) {
 	dir := t.TempDir()
 	notAKey := filepath.Join(dir, "notes.txt")
